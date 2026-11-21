@@ -550,6 +550,11 @@ def line_candidates(mp, rel, src, stmts, ln):
         if m:
             cls_users = name_users(mp, m.group(1)) | mp.range_tests(rel, best[3], best[4])
             t = t | cls_users
+    # the module's own test file (dialects/dremio.py -> tests/dialects/test_dremio.py)
+    own = f"test_{_stem(rel)}.py"
+    for fl, ks in TESTS_BY_FILE.items():
+        if fl.rsplit("/", 1)[-1] == own:
+            t = t | set(ks)
     if users and fam:
         cand = users & fam
         if cand:
@@ -637,10 +642,11 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
                         continue
                     if same == "syntax":
                         reasons.append(f"SYNTAX {old}")
-                        if old in mp.imp:
-                            sel |= all_tests
+                        if old.startswith("tests/") and old.rsplit("/", 1)[-1].startswith("test_"):
+                            sel |= set(tests_by_file.get(old, []))  # only this test module fails to import
                         else:
-                            sel |= mp.file_tests(old)
+                            # lazily imported modules (dialects) are loaded from many test files
+                            sel |= all_tests
                         continue
                 else:
                     reasons.append(f"apply-failed {old}")
@@ -656,8 +662,13 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
                 users = set()
                 for n in added_names:
                     users |= name_users(mp, n)
-                fam = stem_users(mp, old)
-                hit = (users & fam) if (users and fam) else (users or fam or mp.file_tests(old))
+                fam = stem_users(mp, old) or set()
+                hit = (users & fam) or (users | fam) or mp.file_tests(old)
+                # a new generator handler `foo_sql` changes output for expression class Foo everywhere
+                # this generator (or one inheriting from it) is used
+                for n in added_names:
+                    if n.endswith("_sql"):
+                        hit |= expr_class_users(mp, n[:-4])
                 sel |= hit
                 reasons.append(f"added[{','.join(sorted(added_names))[:60]}] {old} -> {len(hit)}")
             touched = set(f["changed"]) | set(f["ins"]) | {i + 1 for i in f["ins"]}
@@ -721,6 +732,26 @@ def collection_files(rel, stmts, touched):
             g = cl.get(str(l))
             if g is not None:
                 out.update(_COLLECT["files"][i] for i in _COLLECT["groups"][g])
+    return out
+
+
+_EXPR_NAMES = None
+
+
+def expr_class_users(mp, key):
+    """Tests that ran code mentioning the expression class whose lowercase name is `key`."""
+    global _EXPR_NAMES
+    if _EXPR_NAMES is None:
+        _EXPR_NAMES = {}
+        for rel in mp.lines:
+            if rel.startswith("sqlglot/expressions") or rel == "sqlglot/expressions.py":
+                for l in source_lines(rel) or []:
+                    m = re.match(r"class (\w+)\(", l)
+                    if m:
+                        _EXPR_NAMES.setdefault(m.group(1).lower(), set()).add(m.group(1))
+    out = set()
+    for cname in _EXPR_NAMES.get(key.replace("_", ""), ()) | _EXPR_NAMES.get(key, set()):
+        out |= name_users(mp, cname)
     return out
 
 
