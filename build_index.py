@@ -12,6 +12,7 @@ import gzip
 import io
 import json
 import marshal
+import os
 import sys
 import tokenize
 from pathlib import Path
@@ -151,6 +152,102 @@ def dialect_index(src):
     return {"users": users, "deps": {k: sorted(v) for k, v in needed_by.items()}, "fixtures": fix}
 
 
+def import_index(src):
+    """{"eager": [modules `import sqlglot` loads], "testmods": {test file: [sqlglot modules its import
+    loads]}, "importers": {module: [modules whose top-level import (transitively) needs it]}}.
+
+    Used when a patch can make a module fail to import (syntax error): exactly the tests that load it
+    break. Module paths are repo-relative ("sqlglot/x/y.py")."""
+    import ast
+    import subprocess
+
+    probe = (
+        "import sys, json, importlib\n"
+        "base = set(sys.modules)\n"
+        "target = sys.argv[1]\n"
+        "try:\n"
+        "    importlib.import_module(target)\n"
+        "except BaseException:\n"
+        "    pass\n"
+        "out = sorted({m.__file__ for n, m in list(sys.modules.items())\n"
+        "              if getattr(m, '__file__', None) and n.split('.')[0] == 'sqlglot'})\n"
+        "print(json.dumps(out))\n")
+    env = dict(os.environ, PYTHONPATH=str(src), PYTHONDONTWRITEBYTECODE="1")
+
+    def loaded(modname):
+        try:
+            r = subprocess.run([sys.executable, "-c", probe, modname], cwd=str(src), env=env,
+                               capture_output=True, text=True, timeout=120)
+            files = json.loads(r.stdout.strip().splitlines()[-1])
+        except Exception:  # noqa: BLE001
+            return None
+        rels = []
+        for f in files:
+            p = Path(f).resolve()
+            try:
+                rels.append(p.relative_to(src.resolve()).as_posix())
+            except ValueError:
+                pass
+        return rels
+
+    eager = loaded("sqlglot") or []
+    testmods = {}
+    for p in sorted((src / "tests").rglob("test_*.py")):
+        rel = p.relative_to(src).as_posix()
+        mods = loaded(rel[:-3].replace("/", "."))
+        if mods is not None:
+            testmods[rel] = [m for m in mods if m not in eager]
+    # top-level import graph inside sqlglot/
+    deps = {}
+    lazy = {}
+    for p in (src / "sqlglot").rglob("*.py"):
+        rel = p.relative_to(src).as_posix()
+        try:
+            tree = ast.parse(p.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        ds = set()
+        for node in tree.body:
+            names = []
+            if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("sqlglot"):
+                names.append(node.module)
+                names += [f"{node.module}.{a.name}" for a in node.names]
+            elif isinstance(node, ast.Import):
+                names += [a.name for a in node.names if a.name.startswith("sqlglot")]
+            for n in names:
+                for cand in (n.replace(".", "/") + ".py", n.replace(".", "/") + "/__init__.py"):
+                    if (src / cand).exists():
+                        ds.add(cand)
+        deps[rel] = ds
+        # imports anywhere (incl. inside functions): their lines' runtime users load the module
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("sqlglot"):
+                names.append(node.module)
+                names += [f"{node.module}.{a.name}" for a in node.names]
+            elif isinstance(node, ast.Import):
+                names += [a.name for a in node.names if a.name.startswith("sqlglot")]
+            for n in names:
+                for cand in (n.replace(".", "/") + ".py", n.replace(".", "/") + "/__init__.py"):
+                    if (src / cand).exists():
+                        lazy.setdefault(cand, []).append([rel, node.lineno])
+    importers = {}
+    rev = {}
+    for m, ds in deps.items():
+        for d in ds:
+            rev.setdefault(d, set()).add(m)
+    for mod in deps:
+        seen, stack = set(), [mod]
+        while stack:
+            x = stack.pop()
+            for y in rev.get(x, ()):
+                if y not in seen:
+                    seen.add(y)
+                    stack.append(y)
+        importers[mod] = sorted(seen)
+    return {"eager": eager, "testmods": testmods, "importers": importers, "lazy": lazy}
+
+
 def main():
     src, out, mapgz = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
     import re
@@ -169,9 +266,10 @@ def main():
                 names.setdefault(w, []).append(rel)
     m = json.loads(gzip.decompress(mapgz.read_bytes()))
     dialects = marshal.dumps(dialect_index(src))
+    imports = marshal.dumps(import_index(src))
     with open(out, "wb") as f:
         marshal.dump({"files": files, "map": marshal.dumps(m), "names": marshal.dumps(names), "texts": texts,
-                      "dialects": dialects}, f)
+                      "dialects": dialects, "imports": imports}, f)
     print(f"index: {len(files)} files -> {out.stat().st_size / 1e6:.1f} MB", file=sys.stderr)
 
 

@@ -805,8 +805,12 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
                         if old.startswith("tests/") and old.rsplit("/", 1)[-1].startswith("test_"):
                             sel |= set(tests_by_file.get(old, []))  # only this test module fails to import
                         else:
-                            # lazily imported modules (dialects) are loaded from many test files
-                            sel |= all_tests
+                            hit = import_failure_tests(mp, old) if IMPORT_FAIL else None
+                            if hit is None:
+                                sel |= all_tests  # eagerly imported (or unknown): everything breaks
+                            else:
+                                sel |= hit
+                                reasons.append(f"import-fail {old} -> {len(hit)}")
                         continue
                 else:
                     reasons.append(f"apply-failed {old}")
@@ -888,6 +892,41 @@ TPC_CONSUMERS = {
         "tests/test_executor.py::TestExecutor::test_execute_tpcds"),
 }
 _DIAL = []
+
+
+IMPORT_FAIL = os.environ.get("BR_IMPORT_FAIL", "1") == "1"
+_IMP = []
+
+
+def import_failure_tests(mp, rel):
+    """Tests that break when module `rel` can't be imported (e.g. a syntax error), or None when
+    `import sqlglot` itself loads it (then every test breaks) or the index is missing."""
+    if not _IMP:
+        b = load_index().get("imports")
+        if b is None:
+            _IMP.append(None)
+        else:
+            import marshal
+            _IMP.append(marshal.loads(b))
+    d = _IMP[0]
+    if d is None or not rel.startswith("sqlglot/"):
+        return None
+    if rel in set(d["eager"]):
+        return None
+    broken = {rel} | set(d["importers"].get(rel, ()))
+    if broken & set(d["eager"]):
+        return None
+    out = set()
+    for m in broken:
+        out |= set(mp.file_tests(m))  # runtime users (lazy imports inside tests)
+        out |= dialect_dependents(m)  # tests naming a dialect that loads it
+    for m in broken:
+        for f, ln in d.get("lazy", {}).get(m, ()):
+            out |= set(mp.line_tests(f, ln))  # tests that ran an import of it (also inside functions)
+    for tf, mods in d["testmods"].items():
+        if broken & set(mods):
+            out |= set(TESTS_BY_FILE.get(tf, []))  # the test module itself fails to import
+    return out
 
 
 def dialect_dependents(rel):
