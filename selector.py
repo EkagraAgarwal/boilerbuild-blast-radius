@@ -390,12 +390,21 @@ def table_lookup(rel, f):
             with open(TABLE_PATH, "rb") as fh:
                 _table.append(marshal.load(fh))
         except Exception:  # noqa: BLE001
-            _table.append({})
+            _table.append(({}, []))
+    keys, sets = _table[0]
     (ln,) = f["changed"]
-    v = _table[0].get(f"{rel}\t{ln}\t{add[0]}")
+    v = keys.get(f"{rel}\t{ln}\t{add[0]}")
     if v is None or v[0] != rem[0]:
         return None
-    return set(v[1])
+    b = int.from_bytes(sets[v[1]], "little")
+    out = set()
+    i = 0
+    while b:
+        if b & 1:
+            out.add(i)
+        b >>= 1
+        i += 1
+    return out
 _EQ_HINT = re.compile(r"\bis\b|==|!=")
 
 
