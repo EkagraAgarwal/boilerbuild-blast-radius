@@ -4,6 +4,3 @@ __pycache__/
 sample/
 index.marshal
 table.marshal
-table.json.gz
-table.marshal
-mk_table.py
