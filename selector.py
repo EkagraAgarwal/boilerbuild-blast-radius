@@ -1228,7 +1228,12 @@ def main():
         # fully answered by the mutant table or AST equality, to count them via the board's misses
         unresolved = [f["old"] for f in _f.values() if f["old"] and f["old"].endswith(".py")
                       and f"table {f['old']} -> " not in " ".join(reasons) and f"ast-same {f['old']}" not in reasons]
-        if unresolved:
+        # probe 2: only single-line edits of sqlglot/ files (an operator we did not enumerate)
+        def _single(f):
+            rem = [l for l in f["removed"] if not is_trivial(l)]
+            add = [l for l in f["added"] if not is_trivial(l)]
+            return f["old"].startswith("sqlglot/") and len(rem) == 1 and len(add) == 1
+        if unresolved and all(_single(f) for f in _f.values() if f["old"] in unresolved):
             sel = set()
         cost, ws = pack(sel, ms)
         px = [r for r in reasons if r.startswith("proxy")]
