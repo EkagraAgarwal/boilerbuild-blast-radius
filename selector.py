@@ -88,6 +88,7 @@ class Map:
         self.n = m["n"]
         self._sets_b64 = m["sets"]
         self._sets = {}
+        self._ints = {}
         self.lines = m["lines"]
         self.imp = {k: set(v) for k, v in m["imp"].items()}
         self.opens = m["opens"]
@@ -99,6 +100,13 @@ class Map:
             s = {(j << 3) | k for j, byte in enumerate(b) if byte for k in range(8) if byte >> k & 1}
             self._sets[i] = s
         return s
+
+    def has(self, i, k):
+        """Is test k in set i? (bit test on a cached int, no set decoding)"""
+        v = self._ints.get(i)
+        if v is None:
+            v = self._ints[i] = int.from_bytes(base64.b64decode(self._sets_b64[i]), "little")
+        return (v >> k) & 1 == 1
 
     def line_tests(self, rel, ln):
         d = self.lines.get(rel)
@@ -545,7 +553,9 @@ def line_candidates(mp, rel, src, stmts, ln):
     for c in stmts:
         if c[2] == "ClassDef" and c[3] < lo and hi <= c[4] and (best is None or c[3] > best[3]):
             best = c
-    if best is not None:
+    family_module = rel.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/",
+                                    "sqlglot/tokenizers/", "sqlglot/typing/"))
+    if best is not None and not family_module:
         m = re.match(r"\s*class\s+(\w+)", src[best[3] - 1])
         if m:
             cls_users = name_users(mp, m.group(1)) | mp.range_tests(rel, best[3], best[4])
@@ -750,7 +760,7 @@ def expr_class_users(mp, key):
                     if m:
                         _EXPR_NAMES.setdefault(m.group(1).lower(), set()).add(m.group(1))
     out = set()
-    for cname in _EXPR_NAMES.get(key.replace("_", ""), ()) | _EXPR_NAMES.get(key, set()):
+    for cname in set(_EXPR_NAMES.get(key.replace("_", ""), ())) | set(_EXPR_NAMES.get(key, ())):
         out |= name_users(mp, cname)
     return out
 
@@ -786,6 +796,145 @@ def pack(tests, ms):
         if best is None or cost < best[0]:
             best = (cost, ws)
     return best
+
+
+# ---------------------------------------------------------------- TPC-DS proxy
+# test_execute_tpcds (21.5 s) optimizes the 99 TPC-DS queries and runs them with the Python
+# executor. TestOptimizer::test_tpcds (2.2 s) optimizes the same queries and checks the SQL.
+# If the patch only touches code both tests run (nothing executor-only, no generators, no
+# fixtures), the executor test can only change if the optimized queries change, which the
+# optimizer test detects. So run the optimizer test here; if it passes, neither is needed.
+EXEC_TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+OPT_TPCDS = "tests/test_optimizer.py::TestOptimizer::test_tpcds"
+PROXY_ENABLED = os.environ.get("BR_PROXY", "1") == "1"
+PROXY_UNSAFE = ("sqlglot/executor/", "sqlglot/generator.py", "sqlglot/generators/", "sqlglot/serde.py",
+                "sqlglot/dialects/duckdb.py", "sqlglot/dialects/python.py")
+
+
+def proxy_eligible(mp, files, reasons, e, o):
+    if any(r.startswith(("SYNTAX", "apply-failed", "error", "collection", "cached", "conftest", "deleted",
+                         "renamed", "binary", "repo-file", "unmapped", "pytest-config", "read-as-data"))
+           for r in reasons):
+        return False
+    for rel, f in files.items():
+        old = f["old"]
+        if old is None or f["new"] != old or f.get("binary"):
+            return False
+        if not old.endswith(".py") or not old.startswith("sqlglot/") or old.startswith(PROXY_UNSAFE):
+            return False
+        src = source_lines(old)
+        stmts = stmt_index(old, src)
+        touched = set(f["changed"]) | set(f["ins"]) | {i + 1 for i in f["ins"]}
+        d = mp.lines.get(old) or {}
+        for ln in touched:
+            s_ = innermost(stmts, ln)
+            if s_ is None:
+                continue
+            lo, hi = (s_[3], s_[4]) if s_[2] in ("FunctionDef", "AsyncFunctionDef", "ClassDef") else (s_[0], s_[1])
+            if not s_[5] and s_[2] not in ("FunctionDef", "AsyncFunctionDef"):
+                return False  # module/class level: import-time effects aren't proven by coverage
+            for l in range(lo, hi + 1):
+                k = d.get(str(l))
+                if k is not None and mp.has(k, e) and not mp.has(k, o):
+                    return False  # executor-only code
+    return True
+
+
+def _cg_usec():
+    try:
+        with open("/sys/fs/cgroup/cpu.stat") as fh:
+            for l in fh:
+                if l.startswith("usage_usec"):
+                    return int(l.split()[1])
+    except OSError:
+        pass
+    return 0
+
+
+PROXY_CPU_PER_QUERY = 0.12
+PROXY_CPU_BASE = 0.6
+
+
+def proxy_tpcds(plans, mp, num, ids, t_start, ms=None):
+    e, o = num.get(EXEC_TPCDS), num.get(OPT_TPCDS)
+    if not PROXY_ENABLED or e is None or o is None:
+        return
+    todo = [p for p in plans if e in p[2] and proxy_eligible(mp, p[4], p[3], e, o)]
+    if not todo:
+        return
+    try:
+        import runner
+    except Exception as ex:
+        log(f"proxy: runner unavailable {ex!r}")
+        return
+    import resource
+    import shutil
+    import subprocess
+
+    script = os.path.join(HERE, "tpcds_proxy.py")
+    qm = None
+    try:
+        import partial as _partial
+        qm = json.loads(gzip.decompress(open(os.path.join(HERE, "querymap.json.gz"), "rb").read()))
+    except Exception as ex:  # noqa: BLE001
+        log(f"proxy: no query map ({ex!r}); replaying all queries")
+    for p in todo:
+        subset = ""
+        nq = 99
+        if qm is not None:
+            changed = {}
+            for rel, f in p[4].items():
+                src = source_lines(f["old"])
+                stmts = stmt_index(f["old"], src)
+                touched = set(f["changed"]) | set(f["ins"]) | {i + 1 for i in f["ins"]}
+                lines = changed.setdefault(f["old"], set())
+                for ln in touched:
+                    s_ = innermost(stmts, ln)
+                    if s_ is None:
+                        continue
+                    lo, hi = (s_[3], s_[4]) if s_[2] in ("FunctionDef", "AsyncFunctionDef") else (s_[0], s_[1])
+                    lines.update(range(lo, hi + 1))
+            try:
+                q, touches_setup = _partial.queries_touching(qm, "tpcds", changed)
+                if not touches_setup and q:
+                    subset = ",".join(map(str, q))
+                    nq = len(q)
+            except Exception as ex:  # noqa: BLE001
+                log(f"proxy: query map lookup failed {ex!r}")
+        if time.monotonic() - t_start > 110:
+            p[3].append("proxy: skipped (time)")
+            continue
+        if ms is not None:
+            saving = (pack(p[2], ms)[0] - pack(p[2] - {e, o}, ms)[0]) / 1000
+            est = PROXY_CPU_BASE + PROXY_CPU_PER_QUERY * nq
+            if saving <= est:
+                p[3].append(f"proxy: not worth it (saving {saving:.1f}s <= est {est:.1f}s)")
+                continue
+        c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        g0 = _cg_usec()
+        ok = False
+        try:
+            changes = runner.apply_patch(p[1], str(SRC))
+            if os.path.exists(runner.RUN_DIR):
+                shutil.rmtree(runner.RUN_DIR, ignore_errors=True)
+            os.makedirs(runner.RUN_DIR, exist_ok=True)
+            runner.build_tree(str(SRC), changes)
+            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+            r = subprocess.run([sys.executable, script, runner.TREE, subset], env=env, timeout=40,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            ok = r.returncode == 0
+            why = "passed" if ok else (r.stderr.strip().splitlines() or ["failed"])[-1][:80]
+        except Exception as ex:  # noqa: BLE001
+            why = f"error {ex!r}"[:80]
+        finally:
+            shutil.rmtree(runner.RUN_DIR, ignore_errors=True)
+        c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        cpu = (c1.ru_utime - c0.ru_utime) + (c1.ru_stime - c0.ru_stime)
+        if ok:
+            p[2] = p[2] - {e, o}
+            p[3].append(f"proxy: optimizer tpcds passed on {subset.count(',') + 1 if subset else 'all'} queries -> dropped exec tpcds ({cpu:.2f}s)")
+        else:
+            p[3].append(f"proxy: kept ({why}, {cpu:.2f}s)")
 
 
 # Running a candidate set ourselves pays off only when it's cheap: optimizer/executor tests cost
@@ -833,7 +982,9 @@ def main():
             log(f"{stem}: selector error {e!r}; selecting all")
             sel, reasons = set(ms), ["error"]
         sel &= set(ms)
-        plans.append([stem, text, sel, reasons])
+        plans.append([stem, text, sel, reasons, files])
+
+    proxy_tpcds(plans, mp, num, ids, t_start, ms)
 
     eligible = []
     if RUN_ENABLED:
@@ -867,9 +1018,10 @@ def main():
         except Exception:
             pass
 
-    for cid, _text, sel, reasons in plans:
+    for cid, _text, sel, reasons, _f in plans:
         cost, ws = pack(sel, ms)
-        log(f"{cid}: {len(sel)} tests, {cost/1000:.1f}s {'; '.join(reasons)[:300]}")
+        px = [r for r in reasons if r.startswith("proxy")]
+        log(f"{cid}: {len(sel)} tests, {cost/1000:.1f}s {' | '.join(px)} {'; '.join(r for r in reasons if r not in px)[:300]}")
         print(json.dumps({"commit": cid, "workers": ws}), flush=True)
 
 
