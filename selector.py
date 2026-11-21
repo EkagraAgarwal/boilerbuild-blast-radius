@@ -360,7 +360,53 @@ def fast_same(rel, f, src, new):
         return "syntax"
     except ValueError:
         return False
+    if EQUIV and _equiv_candidate(f):
+        try:
+            if equiv_same("\n".join(src), "\n".join(new)):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
     return False
+
+
+EQUIV = os.environ.get("BR_EQUIV", "1") == "1"
+_EQ_HINT = re.compile(r"\bis\b|==|!=")
+
+
+def _equiv_candidate(f):
+    return any(_EQ_HINT.search(l) for l in f["removed"]) and any(_EQ_HINT.search(l) for l in f["added"])
+
+
+def _singleton(node):
+    """None, or an enum-style member Foo.BAR / mod.Foo.BAR (identity == equality for these)."""
+    import ast
+    if isinstance(node, ast.Constant):
+        return node.value is None
+    if isinstance(node, ast.Attribute) and node.attr.isupper() and len(node.attr) > 1:
+        v = node.value
+        base = v.id if isinstance(v, ast.Name) else v.attr if isinstance(v, ast.Attribute) else ""
+        return base[:1].isupper() and not base.isupper()
+    return False
+
+
+def equiv_same(old_text, new_text):
+    """ASTs equal after treating `is`/`is not` as `==`/`!=` when compared with None or an enum member."""
+    import ast
+
+    def norm(text):
+        tree = ast.parse(text)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare):
+                ops = list(node.ops)
+                seq = [node.left] + list(node.comparators)
+                for i, op in enumerate(ops):
+                    if isinstance(op, (ast.Is, ast.IsNot, ast.Eq, ast.NotEq)) and (
+                            _singleton(seq[i]) or _singleton(seq[i + 1])):
+                        ops[i] = ast.Eq() if isinstance(op, (ast.Is, ast.Eq)) else ast.NotEq()
+                node.ops = ops
+        return ast.dump(tree)
+
+    return norm(old_text) == norm(new_text)
 
 
 def ast_same(old_text, new_text):
