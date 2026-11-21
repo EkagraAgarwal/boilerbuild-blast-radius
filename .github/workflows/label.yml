@@ -1,0 +1,55 @@
+name: mutation-labels
+# Mutation testing of sqlglot @ eb11aec: each job applies single-token mutants one at a time and runs
+# the tests that cover the mutated line, recording which ones fail.
+on:
+  push:
+    branches: [labeling]
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    container:
+      image: python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    env:
+      SKIP_INTEGRATION: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
+      LT_PROXY: /tools/tpcds_proxy.py
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: pip install --no-cache-dir -q -r requirements.lock
+      - name: sqlglot
+        run: |
+          python - <<'EOF'
+          import io, shutil, tarfile, urllib.request as u
+          sha = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
+          tf = tarfile.open(fileobj=io.BytesIO(u.urlopen(f"https://github.com/tobymao/sqlglot/archive/{sha}.tar.gz", timeout=300).read()), mode="r:gz")
+          top = tf.getmembers()[0].name.split("/", 1)[0]
+          tf.extractall("/tmp/sg", filter="data")
+          shutil.move("/tmp/sg/" + top, "/src")
+          EOF
+          mkdir -p /tools /work/allmut
+          cp tools/*.py /tools/
+          cp data/tests.json /work/tests.json
+          cp data/mutants.json /work/allmut/
+          python -c "import gzip,shutil; shutil.copyfileobj(gzip.open('data/sel.jsonl.gz'), open('/work/allmut/sel.jsonl','wb'))"
+          python -c "import json; [print(json.dumps({'id': l.strip(), 'status': 'seed'})) for l in open('data/done_ids.txt') if l.strip()]" > /work/allmut/labels.jsonl
+          nproc; free -g
+      - name: label
+        run: |
+          python /tools/label_table.py --out /work/allmut/labels.jsonl --jobs 4 --order ratio \
+            --shard ${{ matrix.shard }}/20 --deadline-s ${DEADLINE:-6000} --max-label-ms 300000 || true
+          grep -v '"status": "seed"' /work/allmut/labels.jsonl > labels-${{ matrix.shard }}.jsonl || true
+          wc -l labels-${{ matrix.shard }}.jsonl
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: labels-${{ github.run_number }}-${{ matrix.shard }}
+          path: labels-${{ matrix.shard }}.jsonl
+          retention-days: 3
