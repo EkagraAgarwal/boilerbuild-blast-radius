@@ -1199,6 +1199,12 @@ def main():
             pass
 
     for cid, _text, sel, reasons, _f in plans:
+        # DIAGNOSTIC PROBE (branch "probe" only): select nothing for commits whose .py edits are not
+        # fully answered by the mutant table or AST equality, to count them via the board's misses
+        unresolved = [f["old"] for f in _f.values() if f["old"] and f["old"].endswith(".py")
+                      and f"table {f['old']} -> " not in " ".join(reasons) and f"ast-same {f['old']}" not in reasons]
+        if unresolved:
+            sel = set()
         cost, ws = pack(sel, ms)
         px = [r for r in reasons if r.startswith("proxy")]
         log(f"{cid}: {len(sel)} tests, {cost/1000:.1f}s {' | '.join(px)} {'; '.join(r for r in reasons if r not in px)[:300]}")
