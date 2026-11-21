@@ -539,6 +539,17 @@ def line_candidates(mp, rel, src, stmts, ln):
             if any(p.search(txt) for p in pats):
                 users |= set(ks)
     fam = stem_users(mp, rel) if not rel.startswith("tests/") else None
+    # class-body statement: every test that touched the class itself (e.g. exp.Variance users)
+    cls_users = set()
+    best = None
+    for c in stmts:
+        if c[2] == "ClassDef" and c[3] < lo and hi <= c[4] and (best is None or c[3] > best[3]):
+            best = c
+    if best is not None:
+        m = re.match(r"\s*class\s+(\w+)", src[best[3] - 1])
+        if m:
+            cls_users = name_users(mp, m.group(1)) | mp.range_tests(rel, best[3], best[4])
+            t = t | cls_users
     if users and fam:
         cand = users & fam
         if cand:
