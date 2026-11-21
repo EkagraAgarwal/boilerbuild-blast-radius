@@ -689,7 +689,7 @@ def stem_users(mp, rel):
 
 
 TESTS_BY_FILE = {}
-FUNC_WIDEN = os.environ.get("BR_FUNC_WIDEN", "1") == "1"
+FUNC_WIDEN = os.environ.get("BR_FUNC_WIDEN", "0") == "1"
 ASSIGN_NAME = re.compile(r"^\s*([A-Za-z_]\w*)\s*(?::[^=]+)?=(?!=)")
 IMPORT_NAMES = re.compile(r"^\s*(?:from\s+\S+\s+)?import\s+(.+)$")
 
