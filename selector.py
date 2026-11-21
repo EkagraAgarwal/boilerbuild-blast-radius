@@ -1270,7 +1270,16 @@ def main():
             rem = [l for l in f["removed"] if not is_trivial(l)]
             add = [l for l in f["added"] if not is_trivial(l)]
             return f["old"].startswith("sqlglot/") and len(rem) == 1 and len(add) == 1
-        if unresolved and all(_single(f) for f in _f.values() if f["old"] in unresolved):
+        # probe 2b: only commits whose unresolved edit is a known mutant we failed to label
+        _uk = set(json.load(open(os.path.join(HERE, "unlabeled_keys.json"))))
+        def _known_unlabeled(f):
+            rem = [l for l in f["removed"] if not is_trivial(l)]
+            add = [l for l in f["added"] if not is_trivial(l)]
+            if len(rem) != 1 or len(add) != 1 or len(f["changed"]) != 1:
+                return False
+            (ln,) = f["changed"]
+            return f"{f['old']}	{ln}	{add[0]}" in _uk
+        if unresolved and all(_known_unlabeled(f) for f in _f.values() if f["old"] in unresolved):
             sel = set()
         cost, ws = pack(sel, ms)
         px = [r for r in reasons if r.startswith("proxy")]
