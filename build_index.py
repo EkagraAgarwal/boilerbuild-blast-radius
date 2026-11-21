@@ -57,6 +57,100 @@ def strlines_of(text):
     return sorted(s)
 
 
+FAMILY = ("dialects", "parsers", "generators", "tokenizers", "typing")
+
+
+def dialect_index(src):
+    """{"users": {dialect: [test ids naming it]}, "deps": {module rel: [dialects importing it]}}.
+
+    A dialect module that fails to import breaks every test that names that dialect (or one that
+    inherits from it), even tests whose coverage never reaches dialect-specific lines."""
+    import ast
+
+    names = sorted(p.stem for p in (src / "sqlglot" / "dialects").glob("*.py")
+                   if p.stem not in ("__init__", "dialect"))
+    nameset = set(names)
+
+    def strings(node):
+        return {n.value for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+
+    users = {}
+    for p in sorted((src / "tests").rglob("test_*.py")):
+        rel = p.relative_to(src).as_posix()
+        try:
+            tree = ast.parse(p.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                cls = set()
+                for b in node.body:
+                    if isinstance(b, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "dialect" for t in b.targets):
+                        cls |= strings(b) & nameset
+                for b in node.body:
+                    if isinstance(b, (ast.FunctionDef, ast.AsyncFunctionDef)) and b.name.startswith("test"):
+                        tid = f"{rel}::{node.name}::{b.name}"
+                        for d in (strings(b) & nameset) | cls:
+                            users.setdefault(d, []).append(tid)
+                        # iterating the Dialects enum / Dialect.classes loads every dialect
+                        if any(isinstance(n, ast.Name) and n.id == "Dialects" or
+                               isinstance(n, ast.Attribute) and n.attr == "classes" for n in ast.walk(b)):
+                            users.setdefault("*", []).append(tid)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+                for d in strings(node) & nameset:
+                    users.setdefault(d, []).append(f"{rel}::{node.name}")
+
+    # top-level imports between dialect-family modules
+    mods = {}
+    for sub in FAMILY:
+        for p in (src / "sqlglot" / sub).glob("*.py"):
+            rel = p.relative_to(src).as_posix()
+            try:
+                tree = ast.parse(p.read_text(encoding="utf-8"))
+            except SyntaxError:
+                continue
+            deps = set()
+            for node in tree.body:
+                targets = []
+                if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("sqlglot."):
+                    targets.append(node.module)
+                    targets += [f"{node.module}.{a.name}" for a in node.names]
+                elif isinstance(node, ast.Import):
+                    targets += [a.name for a in node.names if a.name.startswith("sqlglot.")]
+                for t in targets:
+                    parts = t.split(".")
+                    if len(parts) >= 3 and parts[1] in FAMILY:
+                        deps.add(f"sqlglot/{parts[1]}/{parts[2]}.py")
+            mods[rel] = deps
+    needed_by = {}
+    for d in names:
+        root = f"sqlglot/dialects/{d}.py"
+        seen, stack = set(), [root]
+        while stack:
+            x = stack.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            stack.extend(mods.get(x, ()))
+        for x in seen:
+            needed_by.setdefault(x, []).append(d)
+    # fixture files that name dialects (e.g. "# dialect: spark" metadata): tests opening them use them
+    import re
+    fix = {}
+    word = re.compile(r"[a-z][a-z0-9]+")
+    for p in sorted((src / "tests" / "fixtures").rglob("*")):
+        if not p.is_file():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore").lower()
+        except OSError:
+            continue
+        found = sorted(set(word.findall(text)) & nameset)
+        if found:
+            fix[p.relative_to(src).as_posix()] = found
+    return {"users": users, "deps": {k: sorted(v) for k, v in needed_by.items()}, "fixtures": fix}
+
+
 def main():
     src, out, mapgz = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
     import re
@@ -74,8 +168,10 @@ def main():
             for w in set(ident.findall(text)):
                 names.setdefault(w, []).append(rel)
     m = json.loads(gzip.decompress(mapgz.read_bytes()))
+    dialects = marshal.dumps(dialect_index(src))
     with open(out, "wb") as f:
-        marshal.dump({"files": files, "map": marshal.dumps(m), "names": marshal.dumps(names), "texts": texts}, f)
+        marshal.dump({"files": files, "map": marshal.dumps(m), "names": marshal.dumps(names), "texts": texts,
+                      "dialects": dialects}, f)
     print(f"index: {len(files)} files -> {out.stat().st_size / 1e6:.1f} MB", file=sys.stderr)
 
 

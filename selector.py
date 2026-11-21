@@ -654,10 +654,11 @@ def line_candidates(mp, rel, src, stmts, ln):
     for fl, ks in TESTS_BY_FILE.items():
         if fl.rsplit("/", 1)[-1] == own:
             t = t | set(ks)
-    if fam and IMPORT_NAMES.match(src[lo - 1]):
+    if fam is not None and IMPORT_NAMES.match(src[lo - 1]):
         # an edited/removed import of a dialect-family module can make the whole module fail to
-        # import (NameError in its class bodies): every user of the family breaks
-        return users & fam | fam | t, f"importtime-import[{','.join(sorted(names))}|fam]"
+        # import (NameError in its class bodies): every test naming a dialect that loads it breaks
+        dep = dialect_dependents(rel)
+        return fam | dep | t, f"importtime-import[{','.join(sorted(names))}|fam+{len(dep)}]"
     if users and fam:
         cand = users & fam
         if cand:
@@ -818,6 +819,39 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
 
 
 _COLLECT = None
+TEST_NUM = {}
+MAP_REF = []
+_DIAL = []
+
+
+def dialect_dependents(rel):
+    """Tests naming any dialect whose module (transitively) imports `rel` at load time."""
+    if not _DIAL:
+        b = load_index().get("dialects")
+        if b is None:
+            _DIAL.append({"users": {}, "deps": {}})
+        else:
+            import marshal
+            _DIAL.append(marshal.loads(b))
+    d = _DIAL[0]
+    out = set()
+    names = list(d["deps"].get(rel, ()))
+    if names:
+        names.append("*")
+    want = set(names)
+    for fx, ds in d.get("fixtures", {}).items():
+        if want & set(ds) and MAP_REF:
+            oi = MAP_REF[0].opens.get(fx)
+            if oi is not None:
+                out |= MAP_REF[0].set(oi)
+    for name in names:
+        for tid in d["users"].get(name, ()):
+            k = TEST_NUM.get(tid)
+            if k is not None:
+                out.add(k)
+            else:  # unittest ids may carry parametrisation suffixes
+                out.update(v for i, v in TEST_NUM.items() if i.startswith(tid + "["))
+    return out
 
 # expression classes validated by the parser while `sqlglot.dialects.duckdb` imports (the only
 # dialect that parses SQL at import time, in DuckDBGenerator's class body)
@@ -1104,6 +1138,8 @@ def main():
         tests_by_file.setdefault(t["file"], []).append(t["number"])
     mp = Map(MAP)
     TESTS_BY_FILE.update(tests_by_file)
+    TEST_NUM.update(num)
+    MAP_REF.append(mp)
 
     plans = []
     cdir = os.path.join(DATA, "commits")
