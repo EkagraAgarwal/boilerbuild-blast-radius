@@ -386,6 +386,19 @@ def line_candidates(mp, rel, src, stmts, ln):
         # signature / decorator / bases change: everything that runs the body
         return mp.range_tests(rel, nlo, nhi), f"header:{kind}"
     if in_func:
+        enc = enclosing_def(src, ln)
+        if enc and enc[0] == "def":
+            head = "\n".join(src[max(0, enc[1] - 4):enc[1]])
+            fname = (re.search(r"def\s+(\w+)", src[enc[1] - 1]) or [None, ""])[1]
+            if fname == "__getattr__" or re.search(r"@(functools\.)?(lru_cache|cache|cached_property)\b", head):
+                # runs once and is cached: coverage only credits the first caller
+                pkg = rel.rsplit("/", 1)[0] + "/"
+                wide = set(t) | mp.file_tests(rel) | name_users(mp, fname)
+                if rel.endswith("__init__.py"):
+                    for r in mp.lines:
+                        if r.startswith(pkg):
+                            wide |= mp.file_tests(r)
+                return wide, f"cached:{fname}"
         return t, None
     imp = mp.imp.get(rel, set())
     if not t and not any(i in imp for i in range(lo, hi + 1)):
