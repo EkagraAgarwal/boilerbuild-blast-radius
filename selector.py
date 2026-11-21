@@ -405,41 +405,6 @@ def _in_strings(pre, f):
 
 
 EQUIV = os.environ.get("BR_EQUIV", "1") == "1"
-TABLE_ON = os.environ.get("BR_TABLE", "1") == "1"
-TABLE_PATH = os.environ.get("BR_TABLE_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "table.marshal"))
-_table = []
-
-
-def table_lookup(rel, f):
-    """Precomputed single-token mutants: (file, old line no, new line) -> exact failing tests.
-    Only for an edit that replaces exactly one code line (other added lines must be comments)."""
-    rem = [l for l in f["removed"] if not is_trivial(l)]
-    add = [l for l in f["added"] if not is_trivial(l)]
-    if len(rem) != 1 or len(add) != 1 or len(f["changed"]) != 1 or len(f["removed"]) != 1:
-        return None
-    if any(l.strip() and not l.strip().startswith("#") for l in f["added"] if l is not add[0]):
-        return None
-    if not _table:
-        try:
-            import marshal
-            with open(TABLE_PATH, "rb") as fh:
-                _table.append(marshal.load(fh))
-        except Exception:  # noqa: BLE001
-            _table.append(({}, []))
-    keys, sets = _table[0]
-    (ln,) = f["changed"]
-    v = keys.get(f"{rel}\t{ln}\t{add[0]}")
-    if v is None or v[0] != rem[0]:
-        return None
-    b = int.from_bytes(sets[v[1]], "little")
-    out = set()
-    i = 0
-    while b:
-        if b & 1:
-            out.add(i)
-        b >>= 1
-        i += 1
-    return out
 _EQ_HINT = re.compile(r"\bis\b|==|!=")
 
 
@@ -793,10 +758,6 @@ def line_candidates(mp, rel, src, stmts, ln):
 # ---------------------------------------------------------------- selection
 
 def candidates(mp, files, tests_by_file, patch_text, all_tests):
-    # the table answers one mutated line exactly; two mutated code files can interact, so then
-    # fall back to the coverage rules for all of them
-    use_table = TABLE_ON and sum(1 for r_, f_ in files.items() if r_.endswith(".py") and f_["old"]
-                                 and f_["new"] == f_["old"] and table_lookup(f_["old"], f_) is not None) <= 1
     sel = set()
     reasons = []
     for rel, f in files.items():
@@ -854,12 +815,6 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
                 sel |= set(all_tests)
                 reasons.append(f"pytest-config {rel}")
             continue
-        if rel.endswith(".py") and use_table:
-            hit = table_lookup(old, f)
-            if hit is not None:
-                sel |= hit
-                reasons.append(f"table {old} -> {len(hit)}")
-                continue
         if rel.endswith(".py"):
             oi = mp.opens.get(old)
             if oi is not None and mp.set(oi):
@@ -1143,6 +1098,9 @@ def mentioning_tests(rel, tests_by_file):
     return out
 
 
+ALL_SLACK_MS = int(os.environ.get("BR_ALL_SLACK_MS", "500"))
+
+
 def pack(tests, ms):
     """Best LPT split over k = 1..8 workers. Returns (cost_ms, workers)."""
     if not tests:
@@ -1223,7 +1181,7 @@ def proxy_tpcds(plans, mp, num, ids, t_start, ms=None):
     e, o = num.get(EXEC_TPCDS), num.get(OPT_TPCDS)
     if not PROXY_ENABLED or e is None or o is None:
         return
-    todo = [p for p in plans if e in p[2] and not any(r.startswith("table ") for r in p[3])
+    todo = [p for p in plans if e in p[2]
             and proxy_eligible(mp, p[4], p[3], e, o)]
     if not todo:
         return
@@ -1389,8 +1347,13 @@ def main():
         except Exception:
             pass
 
+    all_cost, all_ws = pack(set(ms), ms)
     for cid, _text, sel, reasons, _f in plans:
         cost, ws = pack(sel, ms)
+        if sel and all_cost - cost <= ALL_SLACK_MS:
+            # the whole suite packs (almost) as cheaply: run it and leave nothing out
+            cost, ws = all_cost, all_ws
+            reasons.append("whole-suite")
         px = [r for r in reasons if r.startswith("proxy")]
         log(f"{cid}: {len(sel)} tests, {cost/1000:.1f}s {' | '.join(px)} {'; '.join(r for r in reasons if r not in px)[:300]}")
         print(json.dumps({"commit": cid, "workers": ws}), flush=True)
