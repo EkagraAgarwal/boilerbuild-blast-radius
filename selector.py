@@ -366,7 +366,21 @@ def fast_same(rel, f, src, new):
                 return True
         except Exception:  # noqa: BLE001
             pass
+    if DOCS and _in_strings(pre, f) and ast_same("\n".join(src), "\n".join(new)) is True:
+        return True  # only docstrings differ
     return False
+
+
+DOCS = os.environ.get("BR_DOCS", "1") == "1"
+
+
+def _in_strings(pre, f):
+    """Every touched line is inside a multi-line string, or is itself a one-line string literal."""
+    if pre is None:
+        return False
+    strl = set(pre["strlines"])
+    touched = set(f["changed"]) | set(f["ins"])
+    return bool(touched) and touched <= strl
 
 
 EQUIV = os.environ.get("BR_EQUIV", "1") == "1"
@@ -433,7 +447,7 @@ def equiv_same(old_text, new_text):
     import ast
 
     def norm(text):
-        tree = ast.parse(text)
+        tree = _strip_docstrings(ast.parse(text))
         for node in ast.walk(tree):
             if isinstance(node, ast.Compare):
                 ops = list(node.ops)
@@ -448,16 +462,27 @@ def equiv_same(old_text, new_text):
     return norm(old_text) == norm(new_text)
 
 
+def _strip_docstrings(tree):
+    """Drop docstrings (no test reads __doc__): edits inside them can't change behaviour."""
+    import ast
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+            b = node.body[0]
+            if isinstance(b, ast.Expr) and isinstance(b.value, ast.Constant) and isinstance(b.value.value, str):
+                node.body[0] = ast.Pass()
+    return tree
+
+
 def ast_same(old_text, new_text):
-    """True/False if both parse and ASTs (without positions) are equal / differ.
+    """True/False if both parse and ASTs (without positions or docstrings) are equal / differ.
     'syntax' if the new text doesn't parse."""
     import ast
     try:
-        new = ast.dump(ast.parse(new_text))
+        new = ast.dump(_strip_docstrings(ast.parse(new_text)))
     except SyntaxError:
         return "syntax"
     try:
-        old = ast.dump(ast.parse(old_text))
+        old = ast.dump(_strip_docstrings(ast.parse(old_text)))
     except SyntaxError:
         return False
     return old == new
