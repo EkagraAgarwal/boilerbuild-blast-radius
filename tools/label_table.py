@@ -76,6 +76,7 @@ def collapse_if_long(nodeids, cand):
 
 
 PROXY = os.environ.get("LT_PROXY", "/sub/tpcds_proxy.py")
+SLACK = float(os.environ.get("LT_SLACK", "1"))
 
 
 _QM = []
@@ -151,7 +152,7 @@ def run_one(task):
             f.write("\n".join(lines[:idx] + [new] + lines[idx + 1:]))
         env = dict(os.environ, PYTHONPATH=f"{WORK_DIR}:{TOOLS}", BRLABEL_OUT=out,
                    SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1", PYTHON_CPU_COUNT="2")
-        limit = max(240, 6 * (cand_ms / 1000.0) + 120)
+        limit = max(240, 6 * (cand_ms / 1000.0) + 120) * SLACK
         msg = ""
         # optimizer TPC-DS via the faithful single-process replay (all 99 queries); the executor's
         # TPC-DS outside executor/generator code only fails together with it
@@ -163,7 +164,7 @@ def run_one(task):
             if infer:
                 skip.add(EXEC)
             subset = proxy_subset(rel, lineno, lines)
-            rc_p, st_p = run_group([sys.executable, PROXY, WORK_DIR] + ([subset] if subset else []), env, 300)
+            rc_p, st_p = run_group([sys.executable, PROXY, WORK_DIR] + ([subset] if subset else []), env, 300 * SLACK)
             if st_p != "ok":
                 return result(mid, cand_ms, "timeout", [], [], time.time() - t0, "proxy timeout")
             proxy_fail = rc_p != 0
