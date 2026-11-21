@@ -673,6 +673,10 @@ def line_candidates(mp, rel, src, stmts, ln):
 # ---------------------------------------------------------------- selection
 
 def candidates(mp, files, tests_by_file, patch_text, all_tests):
+    # the table answers one mutated line exactly; two mutated code files can interact, so then
+    # fall back to the coverage rules for all of them
+    use_table = TABLE_ON and sum(1 for r_, f_ in files.items() if r_.endswith(".py") and f_["old"]
+                                 and f_["new"] == f_["old"] and table_lookup(f_["old"], f_) is not None) <= 1
     sel = set()
     reasons = []
     for rel, f in files.items():
@@ -730,7 +734,7 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
                 sel |= set(all_tests)
                 reasons.append(f"pytest-config {rel}")
             continue
-        if rel.endswith(".py") and TABLE_ON:
+        if rel.endswith(".py") and use_table:
             hit = table_lookup(old, f)
             if hit is not None:
                 sel |= hit
