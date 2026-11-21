@@ -676,6 +676,21 @@ def name_users(mp, name):
     return out
 
 
+def _name_exists_in_pristine(mp, name):
+    """Was `name` already present anywhere in the pinned source (so it has real users)?"""
+    global _all_src
+    fl = files_with_name(name)
+    if fl is not None:
+        return bool(fl)
+    if _all_src is None:
+        _all_src = {}
+        for rel in mp.lines:
+            if rel.endswith(".py"):
+                _all_src[rel] = source_lines(rel) or []
+                _all_txt[rel] = "\n".join(_all_src[rel])
+    return any(name in txt for txt in _all_txt.values())
+
+
 def stem_users(mp, rel):
     """Tests that executed code in any module sharing this file's stem (dialect families)."""
     stem = _stem(rel)
@@ -694,7 +709,7 @@ ASSIGN_NAME = re.compile(r"^\s*([A-Za-z_]\w*)\s*(?::[^=]+)?=(?!=)")
 IMPORT_NAMES = re.compile(r"^\s*(?:from\s+\S+\s+)?import\s+(.+)$")
 
 
-def line_candidates(mp, rel, src, stmts, ln):
+def line_candidates(mp, rel, src, stmts, ln, widen_fn=False, bonus=None):
     """Tests that could observe a change at old line ln of rel."""
     s = innermost(stmts, ln)
     if s is None:
@@ -718,9 +733,14 @@ def line_candidates(mp, rel, src, stmts, ln):
                         if r.startswith(pkg):
                             wide |= mp.file_tests(r)
                 return wide, f"cached:{fname}"
-        if FUNC_WIDEN and enc and enc[0] == "def":
+        if enc and enc[0] == "def":
             # a change can make unreached code in the same function reachable: everyone who ran it
-            return set(t) | mp.range_tests(rel, enc[1], enc[2]), None
+            fn_tests = mp.range_tests(rel, enc[1], enc[2])
+            if FUNC_WIDEN or widen_fn:
+                return set(t) | fn_tests, None
+            if bonus is not None:
+                # held back as a low-priority candidate: idle workers can pick these up later
+                bonus[0] |= (fn_tests - set(t))
         return t, None
     imp = mp.imp.get(rel, set())
     if not t and not any(i in imp for i in range(lo, hi + 1)):
@@ -790,9 +810,35 @@ def line_candidates(mp, rel, src, stmts, ln):
     return mp.file_tests(rel) | t, "importtime[file]"
 
 
+def _tpc_fixture_parses_cleanly(old, f, patch_text):
+    """Would load_sql_fixture_pairs still parse this TPC fixture after the patch?
+
+    A leading '#' line without a ':' is metadata/tag syntax that the loader rejects; a new
+    comment-only edit is otherwise harmless. Mirrors tests/helpers.py's exact filter/split/meta
+    loop so we keep the narrow TPC selection only when the patched fixture still loads.
+    """
+    if not any(l.lstrip().startswith("#") for l in f["added"]):
+        return True  # fast path: no new leading comments, nothing to check
+    src = source_lines(old)
+    new = apply_hunks(src, patch_text, old) if src is not None else None
+    if new is None:
+        return False
+    filtered = "\n".join(line for line in new if line and not line.startswith("--"))
+    stmts = filtered.split(";")
+    for idx in range(0, len(stmts), 2):
+        if idx + 1 < len(stmts):
+            sql_lines = stmts[idx].strip().split("\n")
+            j = 0
+            while j < len(sql_lines) and sql_lines[j].startswith("#"):
+                if ":" not in sql_lines[j]:
+                    return False
+                j += 1
+    return True
+
+
 # ---------------------------------------------------------------- selection
 
-def candidates(mp, files, tests_by_file, patch_text, all_tests):
+def candidates(mp, files, tests_by_file, patch_text, all_tests, bonus=None):
     # the table answers one mutated line exactly; two mutated code files can interact, so then
     # fall back to the coverage rules for all of them
     use_table = TABLE_ON and sum(1 for r_, f_ in files.items() if r_.endswith(".py") and f_["old"]
@@ -861,33 +907,44 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
                 reasons.append(f"table {old} -> {len(hit)}")
                 continue
         if rel.endswith(".py"):
+            if bonus is not None:
+                bonus[2] |= mp.file_tests(old)  # tier 2: same-file tests, for idle packing
+            # Compute the AST comparison FIRST: a comment/whitespace-only edit to a .py file
+            # cannot break the single test that parses .py sources as data.
+            src = source_lines(old)
+            new = None
+            if src is not None and f["new"] is not None:
+                new = apply_hunks(src, patch_text, f["new"])
+            same = fast_same(old, f, src, new) if new is not None else None
+            if same is True:
+                oi = mp.opens.get(old)
+                typing_meta = TEST_NUM.get("tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata")
+                extra_open = (mp.set(oi) - ({typing_meta} if typing_meta is not None else set())) if oi is not None else set()
+                if extra_open:
+                    sel |= extra_open
+                    reasons.append(f"read-as-data {old} -> {len(extra_open)}")
+                reasons.append(f"ast-same {old}")
+                continue
             oi = mp.opens.get(old)
             if oi is not None and mp.set(oi):
                 # some tests read this source file as text (not just import it)
                 sel |= mp.set(oi)
                 reasons.append(f"read-as-data {old} -> {len(mp.set(oi))}")
-            src = source_lines(old)
             if src is not None and f["new"] is not None:
-                new = apply_hunks(src, patch_text, f["new"])
-                if new is not None:
-                    same = fast_same(old, f, src, new)
-                    if same is True:
-                        reasons.append(f"ast-same {old}")
-                        continue
-                    if same == "syntax":
-                        reasons.append(f"SYNTAX {old}")
-                        if old.startswith("tests/") and old.rsplit("/", 1)[-1].startswith("test_"):
-                            sel |= set(tests_by_file.get(old, []))  # only this test module fails to import
-                        else:
-                            hit = import_failure_tests(mp, old) if IMPORT_FAIL else None
-                            if hit is None:
-                                sel |= all_tests  # eagerly imported (or unknown): everything breaks
-                            else:
-                                sel |= hit
-                                reasons.append(f"import-fail {old} -> {len(hit)}")
-                        continue
-                else:
+                if new is None:
                     reasons.append(f"apply-failed {old}")
+                elif same == "syntax":
+                    reasons.append(f"SYNTAX {old}")
+                    if old.startswith("tests/") and old.rsplit("/", 1)[-1].startswith("test_"):
+                        sel |= set(tests_by_file.get(old, []))  # only this test module fails to import
+                    else:
+                        hit = import_failure_tests(mp, old) if IMPORT_FAIL else None
+                        if hit is None:
+                            sel |= all_tests  # eagerly imported (or unknown): everything breaks
+                        else:
+                            sel |= hit
+                            reasons.append(f"import-fail {old} -> {len(hit)}")
+                    continue
             if IMPORT_FAIL and old.startswith("sqlglot/") and any(
                     re.match(r"(from|import)\s", l) for l in f["added"] + f["removed"]) and not (
                     old in IMPORT_OK and not _removed_import_names_used(f, src, patch_text)):
@@ -899,25 +956,47 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
                 reasons.append(f"toplevel-import {old} -> {'all' if hit is None else len(hit)}")
             stmts = stmt_index(old, src)
             risk = IMPORT_FAIL and old.startswith("sqlglot/") and src and _may_raise_at_import(f, stmts, src)
-            if risk and not (risk == "call" and old in IMPORT_OK):
+            if risk and not (risk in ("call", "header") and old in IMPORT_OK):
                 # an edit to code that runs while the module imports (a call in a class body, a
                 # renamed/deleted top-level def) can make the import raise: every user breaks
                 hit = import_failure_tests(mp, old)
                 sel |= all_tests if hit is None else hit
                 reasons.append(f"import-risk {old} -> {'all' if hit is None else len(hit)}")
+            elif risk == "header" and old in IMPORT_OK:
+                # the header itself imported cleanly, but a def/class renamed or removed by it can
+                # still break its runtime callers, which coverage of a fresh name would not find
+                added_defs = set()
+                for l in f["added"]:
+                    m = re.match(r"\s*(?:async\s+)?(?:def|class)\s+(\w+)", l)
+                    if m:
+                        added_defs.add(m.group(1))
+                for l in f["removed"]:
+                    m = re.match(r"\s*(?:async\s+)?(?:def|class)\s+(\w+)", l)
+                    if m and m.group(1) not in added_defs:
+                        sel |= name_users(mp, m.group(1))
             # names newly defined or assigned by added lines (an override or a new class attribute
             # changes behaviour wherever the base version / the name is used)
             added_names = set()
+            const_names = set()
             for l in f["added"]:
-                m = re.match(r"\s*(?:async\s+)?def\s+(\w+)", l) or re.match(r"\s+([A-Z_][A-Z0-9_]+)\s*(?::[^=]+)?=(?!=)", l)
+                m_def = re.match(r"\s*(?:async\s+)?def\s+(\w+)", l)
+                m_const = re.match(r"\s+([A-Z_][A-Z0-9_]+)\s*(?::[^=]+)?=(?!=)", l)
+                m = m_def or m_const
                 if m:
                     added_names.add(m.group(1))
+                    if m_const:
+                        const_names.add(m.group(1))
             if added_names:
+                # A brand-new, unreferenced helper (e.g. `_lower_func_renamed`) must not widen
+                # the selection to the whole module family: only names that were already visible
+                # in pristine code, constants, dunders and *_sql handlers are meaningful anchors.
+                relevant = {n for n in added_names if n in const_names or n.endswith("_sql")
+                            or (n.startswith("__") and n.endswith("__")) or _name_exists_in_pristine(mp, n)}
                 users = set()
-                for n in added_names:
+                for n in relevant:
                     users |= name_users(mp, n)
                 fam = stem_users(mp, old) or set()
-                hit = (users & fam) or (users | fam) or mp.file_tests(old)
+                hit = ((users & fam) or (users | fam) or mp.file_tests(old)) if relevant else set()
                 # a new generator handler `foo_sql` changes output for expression class Foo everywhere
                 # this generator (or one inheriting from it) is used
                 # (a dialect's generator only generates for that dialect and the dialects built on it:
@@ -928,18 +1007,19 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
                     dd = dialect_dependents(old)
                     if dd:
                         scope = dd | fam
-                if scope is not None and all(n.endswith("_sql") for n in added_names):
+                if relevant and scope is not None and all(n.endswith("_sql") for n in relevant):
                     # handler overrides only: tests in scope that ran the base handler or use the class
                     hit = users & scope
-                for n in added_names:
+                for n in relevant:
                     if n.endswith("_sql"):
                         ec = expr_class_users(mp, n[:-4])
                         hit |= ec if scope is None else (ec & scope)
                 sel |= hit
                 reasons.append(f"added[{','.join(sorted(added_names))[:60]}] {old} -> {len(hit)}")
             touched = set(f["changed"]) | set(f["ins"]) | {i + 1 for i in f["ins"]}
+            pure_del = set(f["changed"]) - set(f["ins"]) - {i + 1 for i in f["ins"]}
             for ln in sorted(touched):
-                t, why = line_candidates(mp, old, src, stmts, ln)
+                t, why = line_candidates(mp, old, src, stmts, ln, widen_fn=(ln in pure_del), bonus=bonus)
                 sel |= t
                 if why:
                     reasons.append(f"{why} {old}:{ln} -> {len(t)}")
@@ -947,9 +1027,18 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
             # (lazy exports, metaclasses), can make that module fail to import -> all its tests fail
             cfiles = collection_files(old, stmts, touched)
             if cfiles:
-                hit = {k for fl in cfiles for k in tests_by_file.get(fl, [])}
-                sel |= hit
-                reasons.append(f"collection {old} -> {len(cfiles)} files/{len(hit)}")
+                unverified = cfiles - COLLECT_OK
+                verified = cfiles & COLLECT_OK
+                if unverified:
+                    hit = {k for fl in unverified for k in tests_by_file.get(fl, [])}
+                    sel |= hit
+                    reasons.append(f"collection {old} -> {len(unverified)} files/{len(hit)}")
+                if verified:
+                    # collection succeeded, but a dialect/module-family runtime test can still
+                    # fail at import time; keep it even after clearing the collection rule
+                    fam_hit = stem_users(mp, old) or mp.file_tests(old)
+                    sel |= fam_hit
+                    reasons.append(f"collection-ok {old} -> {len(verified)} files, fam {len(fam_hit)}")
             if not old.startswith(("sqlglot/", "tests/")):
                 hit = mentioning_tests(old, tests_by_file)
                 sel |= hit
@@ -965,7 +1054,7 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
         else:
             i = mp.opens.get(old)
             tpc = TPC_CONSUMERS.get(old)
-            if tpc is not None and f["new"] == old and not any(l.lstrip().startswith("#") for l in f["added"]):
+            if tpc is not None and f["new"] == old and _tpc_fixture_parses_cleanly(old, f, patch_text):
                 # TestExecutor.setUpClass loads the TPC query files for every test in the class, but only
                 # these tests use the queries (a new "#" line could make the loader raise: all openers)
                 hit = {TEST_NUM[t] for t in tpc if t in TEST_NUM}
@@ -1000,6 +1089,8 @@ IMPORT_FAIL = os.environ.get("BR_IMPORT_FAIL", "1") == "1"
 # modules whose patched version (and every module importing it) imported cleanly at run time, for
 # the commit being re-planned; see verify_imports
 IMPORT_OK = set()
+# test files whose collection (module import) imported cleanly at run time; see verify_imports
+COLLECT_OK = set()
 
 
 def _removed_import_names_used(f, src, patch_text):
@@ -1188,6 +1279,7 @@ def mentioning_tests(rel, tests_by_file):
 
 
 ALL_SLACK_MS = int(os.environ.get("BR_ALL_SLACK_MS", "500"))
+IDLE_FILL = os.environ.get("BR_IDLE_FILL", "1") == "1"
 DROP_HEAVY = [i for i in os.environ.get(
     "BR_DROP_HEAVY", "tests/test_parser.py::TestParser::test_max_nodes,"
     "tests/test_generator.py::TestGenerator::test_generator_memory").split(",") if i]
@@ -1270,11 +1362,28 @@ def partial_executor(plans, num, ms, t_start):
 VERIFY_IMPORTS = os.environ.get("BR_VERIFY_IMPORTS", "1") == "1"
 VERIFY_CPU_EST_MS = 700
 _IMPORT_CHECK = r'''
-import importlib, sys
+import importlib, json, os, sys
 sys.path.insert(0, sys.argv[1])
+os.chdir(sys.argv[1])
+args = sys.argv[2:]
+if "--tests" in args:
+    i = args.index("--tests")
+    sql_mods, test_mods = args[:i], args[i + 1:]
+else:
+    sql_mods, test_mods = args, []
 import sqlglot
-for m in sys.argv[2:]:
+for m in sql_mods:
     importlib.import_module(m)
+ok_t, fail_t = [], []
+for spec in test_mods:
+    fl, m = spec.split("=", 1)
+    try:
+        importlib.import_module(m)
+        ok_t.append(fl)
+    except BaseException:
+        fail_t.append(fl)
+if test_mods:
+    print(json.dumps({"ok": ok_t, "fail": fail_t}))
 '''
 
 
@@ -1286,25 +1395,49 @@ def _import_rules_rels(reasons):
     return out
 
 
+def _collection_rels(reasons, files):
+    """(test files collected by the risky edits, sqlglot/.py files that triggered them)."""
+    cfiles_all = set()
+    c_rels = set()
+    for r in reasons:
+        if r.startswith("collection "):
+            c_rels.add(r.split(" ", 2)[1])
+    for old in c_rels:
+        f = files.get(old)
+        if not f or not old.endswith(".py"):
+            continue
+        src = source_lines(old)
+        if src is None:
+            continue
+        stmts = stmt_index(old, src)
+        touched = set(f["changed"]) | set(f["ins"]) | {i + 1 for i in f["ins"]}
+        cfiles_all |= collection_files(old, stmts, touched)
+    return cfiles_all, c_rels
+
+
 def verify_imports(plans, mp, tests_by_file, ms, t_start):
     if not VERIFY_IMPORTS:
         return
     todo = []
     for p in plans:
         rels = _import_rules_rels(p[3])
-        if not rels or any(r.startswith(("SYNTAX", "apply-failed", "error")) for r in p[3]):
+        cfiles_all, c_rels = _collection_rels(p[3], p[4])
+        if (not rels and not cfiles_all) or any(r.startswith(("SYNTAX", "apply-failed", "error")) for r in p[3]):
             continue
         IMPORT_OK.clear()
-        IMPORT_OK.update(rels)
+        IMPORT_OK.update(rels | c_rels)
+        COLLECT_OK.clear()
+        COLLECT_OK.update(cfiles_all)
         try:
-            sel2, reasons2 = candidates(mp, p[4], tests_by_file, p[1], set(ms))
+            sel2, reasons2 = candidates(mp, p[4], tests_by_file, p[1], set(ms), [set(), set(), set()])
         except Exception:  # noqa: BLE001
             continue
         finally:
             IMPORT_OK.clear()
+            COLLECT_OK.clear()
         sel2 &= set(ms)
         if pack(p[2], ms)[0] - pack(sel2, ms)[0] > VERIFY_CPU_EST_MS:
-            todo.append((p, rels, sel2, reasons2))
+            todo.append((p, rels, c_rels, cfiles_all, sel2, reasons2))
     if not todo:
         return
     try:
@@ -1319,37 +1452,68 @@ def verify_imports(plans, mp, tests_by_file, ms, t_start):
         return
     import marshal
     d = marshal.loads(b)
-    for p, rels, sel2, reasons2 in todo:
+    for p, rels, c_rels, cfiles_all, sel2, reasons2 in todo:
         if time.monotonic() - t_start > 100:
             p[3].append("import check: skipped (time)")
             continue
         mods = set()
-        for rel in rels:
+        for rel in rels | c_rels:
             for m in {rel} | set(d["importers"].get(rel, ())):
-                if m.endswith(".py"):
+                if m.endswith(".py") and not m.endswith("/__main__.py"):
                     m = m[:-3]
                     if m.endswith("/__init__"):
                         m = m[: -len("/__init__")]
                     mods.add(m.replace("/", "."))
+        test_mods = [f"{fl}={fl[:-3].replace('/', '.')}" for fl in sorted(cfiles_all)]
         ok, why = False, ""
+        ok_tests = set()
         try:
             changes = runner.apply_patch(p[1], str(SRC))
             if os.path.exists(runner.RUN_DIR):
                 shutil.rmtree(runner.RUN_DIR, ignore_errors=True)
             os.makedirs(runner.RUN_DIR, exist_ok=True)
             runner.build_tree(str(SRC), changes)
-            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-            r = subprocess.run([sys.executable, "-I", "-c", _IMPORT_CHECK, runner.TREE] + sorted(mods),
-                               env=env, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", SKIP_INTEGRATION="0")
+            cmd = [sys.executable, "-I", "-c", _IMPORT_CHECK, runner.TREE] + sorted(mods)
+            if test_mods:
+                cmd += ["--tests"] + test_mods
+            r = subprocess.run(cmd, env=env, timeout=30, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, cwd=runner.RUN_DIR)
             ok = r.returncode == 0
             why = "" if ok else (r.stderr.strip().splitlines() or ["failed"])[-1][:80]
+            if test_mods and ok:
+                try:
+                    lines_out = [ln for ln in r.stdout.splitlines() if ln.strip()]
+                    if lines_out:
+                        ok_tests = set(json.loads(lines_out[-1])["ok"])
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception as ex:  # noqa: BLE001
             why = f"error {ex!r}"[:80]
         finally:
             shutil.rmtree(runner.RUN_DIR, ignore_errors=True)
         if ok:
-            p[2], p[3] = sel2, reasons2 + [f"import check: {len(mods)} modules import cleanly"]
+            IMPORT_OK.clear()
+            IMPORT_OK.update(rels | c_rels)
+            COLLECT_OK.clear()
+            COLLECT_OK.update(ok_tests)
+            bonus2 = [set(), set(), set()]
+            sel_final = reasons_final = None
+            try:
+                sel_final, reasons_final = candidates(mp, p[4], tests_by_file, p[1], set(ms), bonus2)
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                IMPORT_OK.clear()
+                COLLECT_OK.clear()
+            if sel_final is not None:
+                sel_final &= set(ms)
+            if sel_final is not None and pack(sel_final, ms)[0] < pack(p[2], ms)[0]:
+                p[2], p[3], p[5] = (sel_final,
+                                    reasons_final + [f"import check: {len(mods)} modules import cleanly"],
+                                    bonus2)
+            else:
+                p[3].append(f"import check: no savings ({len(mods)} modules import cleanly)")
         else:
             p[3].append(f"import check: failed ({why})")
 
@@ -1381,6 +1545,8 @@ def pack(tests, ms):
 # optimizer test detects. So run the optimizer test here; if it passes, neither is needed.
 EXEC_TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 OPT_TPCDS = "tests/test_optimizer.py::TestOptimizer::test_tpcds"
+EXEC_TPCH = "tests/test_executor.py::TestExecutor::test_execute_tpch"
+OPT_TPCH = "tests/test_optimizer.py::TestOptimizer::test_tpch"
 PROXY_ENABLED = os.environ.get("BR_PROXY", "1") == "1"
 PROXY_UNSAFE = ("sqlglot/executor/", "sqlglot/generator.py", "sqlglot/generators/", "sqlglot/serde.py",
                 "sqlglot/dialects/duckdb.py", "sqlglot/dialects/python.py")
@@ -1513,12 +1679,98 @@ def proxy_tpcds(plans, mp, num, ids, t_start, ms=None):
             p[3].append(f"proxy: kept ({why}, {cpu:.2f}s)")
 
 
+def proxy_tpch(plans, mp, num, ids, t_start, ms=None):
+    """Same optimizer-proxy trick for TPC-H: the 22 small queries are cheap to replay."""
+    e, o = num.get(EXEC_TPCH), num.get(OPT_TPCH)
+    if not PROXY_ENABLED or e is None or o is None:
+        return
+    todo = [p for p in plans if e in p[2] and not any(r.startswith("table ") for r in p[3])
+            and proxy_eligible(mp, p[4], p[3], e, o)]
+    if not todo:
+        return
+    try:
+        import runner
+    except Exception as ex:  # noqa: BLE001
+        log(f"proxy tpch: runner unavailable {ex!r}")
+        return
+    import resource
+    import shutil
+    import subprocess
+
+    script = os.path.join(HERE, "tpcds_proxy.py")
+    qm = None
+    try:
+        import partial as _partial
+        qm = json.loads(gzip.decompress(open(os.path.join(HERE, "querymap.json.gz"), "rb").read()))
+    except Exception as ex:  # noqa: BLE001
+        log(f"proxy tpch: no query map ({ex!r}); replaying all queries")
+    for p in todo:
+        subset = ""
+        nq = 22
+        if qm is not None:
+            changed = {}
+            for rel, f in p[4].items():
+                src = source_lines(f["old"])
+                stmts = stmt_index(f["old"], src)
+                touched = set(f["changed"]) | set(f["ins"]) | {i + 1 for i in f["ins"]}
+                lines = changed.setdefault(f["old"], set())
+                for ln in touched:
+                    s_ = innermost(stmts, ln)
+                    if s_ is None:
+                        continue
+                    lo, hi = (s_[3], s_[4]) if s_[2] in ("FunctionDef", "AsyncFunctionDef") else (s_[0], s_[1])
+                    lines.update(range(lo, hi + 1))
+            try:
+                q, touches_setup = _partial.queries_touching(qm, "tpch", changed)
+                if not touches_setup and q:
+                    subset = ",".join(map(str, q))
+                    nq = len(q)
+            except Exception as ex:  # noqa: BLE001
+                log(f"proxy tpch: query map lookup failed {ex!r}")
+        if time.monotonic() - t_start > 110:
+            p[3].append("proxy tpch: skipped (time)")
+            continue
+        if ms is not None:
+            saving = (pack(p[2], ms)[0] - pack(p[2] - {e, o}, ms)[0]) / 1000
+            est = PROXY_CPU_BASE + 0.03 * nq  # 22 small TPC-H queries
+            if saving <= est:
+                p[3].append(f"proxy tpch: not worth it (saving {saving:.1f}s <= est {est:.1f}s)")
+                continue
+        c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        ok = False
+        try:
+            changes = runner.apply_patch(p[1], str(SRC))
+            if os.path.exists(runner.RUN_DIR):
+                shutil.rmtree(runner.RUN_DIR, ignore_errors=True)
+            os.makedirs(runner.RUN_DIR, exist_ok=True)
+            runner.build_tree(str(SRC), changes)
+            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+            r = subprocess.run([sys.executable, script, runner.TREE, subset, "tpch"], env=env, timeout=40,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            ok = r.returncode == 0
+            why = "passed" if ok else (r.stderr.strip().splitlines() or ["failed"])[-1][:80]
+        except Exception as ex:  # noqa: BLE001
+            why = f"error {ex!r}"[:80]
+        finally:
+            shutil.rmtree(runner.RUN_DIR, ignore_errors=True)
+        c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        cpu = (c1.ru_utime - c0.ru_utime) + (c1.ru_stime - c0.ru_stime)
+        if ok:
+            p[2] = p[2] - {e, o}
+            p[3].append(f"proxy tpch: optimizer passed on {subset.count(',') + 1 if subset else 'all'} queries -> dropped exec tpch ({cpu:.2f}s)")
+        else:
+            p[3].append(f"proxy tpch: kept ({why}, {cpu:.2f}s)")
+
+
 # Running a candidate set ourselves pays off only when it's cheap: optimizer/executor tests cost
 # several times their recorded seconds to run (module import, setUpClass, process pools).
 EXPENSIVE_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")
 RUN_MAX_EST_S = float(os.environ.get("BR_RUN_MAX", "1.0"))
 RUN_BUDGET_S = float(os.environ.get("BR_RUN_BUDGET", "60"))
 RUN_ENABLED = os.environ.get("BR_RUN", "0") == "1"
+FAST_RUN_ENABLED = os.environ.get("BR_FAST_RUN", "0") == "1"
+FAST_RUN_MAX_S = float(os.environ.get("BR_FAST_MAX", "3.0"))
+FAST_RUN_BUDGET_S = float(os.environ.get("BR_FAST_BUDGET", "25.0"))
 
 
 def run_estimate(sel, tests_meta):
@@ -1529,6 +1781,59 @@ def run_estimate(sel, tests_meta):
             return None
         est += sec * 1.5 + 0.01
     return est
+
+
+def fast_run_candidates(plans, meta, num, ids, ms, t_start):
+    """Run cheap candidate sets on the lite zygote; keep only tests that actually fail."""
+    if not FAST_RUN_ENABLED:
+        return
+    eligible = []
+    for p in plans:
+        if not p[2] or any(r.startswith(("table ", "SYNTAX", "apply-failed", "error", "import-fail"))
+                           for r in p[3]):
+            continue
+        if len(p[2]) == 1 and any(r.startswith("opened tests/fixtures/") for r in p[3]):
+            continue  # single fixture opener: one test, no useful ROI
+        if any((meta.get(k) or ("", 0))[0] in EXPENSIVE_FILES for k in p[2]):
+            continue
+        est = 0.16 + sum(meta[k][1] * 1.15 + 0.005 for k in p[2] if k in meta)
+        packed_s = pack(p[2], ms)[0] / 1000.0
+        if est <= FAST_RUN_MAX_S and est < packed_s * 0.65 and packed_s - est >= 0.8:
+            eligible.append((-(packed_s - est), p))
+    if not eligible:
+        return
+    try:
+        import runner
+    except Exception as ex:  # noqa: BLE001
+        log(f"fast run: runner unavailable {ex!r}")
+        return
+    eligible.sort(key=lambda x: x[0])
+    spent = 0.0
+    ran = False
+    for _neg, p in eligible:
+        if time.monotonic() - t_start > 115 or spent > FAST_RUN_BUDGET_S:
+            p[3].append("fastrun: skipped (budget)")
+            continue
+        orig_n = len(p[2])
+        try:
+            res = runner.run_tests(p[1], [ids[k] for k in sorted(p[2])], src_root=str(SRC),
+                                   timeout_s=12.0, lite=True)
+        except Exception as ex:  # noqa: BLE001
+            p[3].append(f"fastrun: error {ex!r}"[:80])
+            continue
+        ran = True
+        spent += res.get("cpu_s", 0.0)
+        if res["ok"]:
+            failed = {num[i] for i in res["failed"] if i in num}
+            p[3].append(f"fastrun {orig_n} -> {len(failed)} failed ({res['cpu_s']:.2f}s)")
+            p[2] = failed
+        else:
+            p[3].append(f"fastrun: kept ({res.get('error')}, {res.get('cpu_s', 0):.2f}s)"[:100])
+    if ran:
+        try:
+            runner.shutdown(clear_cache=False)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def main():
@@ -1558,18 +1863,21 @@ def main():
             text = fh.read()
         stem = name[:-6]
         files = parse_patch(text)
+        bonus = [set(), set(), set()]
         try:
-            sel, reasons = candidates(mp, files, tests_by_file, text, set(ms))
+            sel, reasons = candidates(mp, files, tests_by_file, text, set(ms), bonus)
         except Exception as e:  # never crash: fall back to everything
             log(f"{stem}: selector error {e!r}; selecting all")
             sel, reasons = set(ms), ["error"]
         sel &= set(ms)
-        plans.append([stem, text, sel, reasons, files])
+        plans.append([stem, text, sel, reasons, files, bonus])
 
     verify_imports(plans, mp, tests_by_file, ms, t_start)
     proxy_tpcds(plans, mp, num, ids, t_start, ms)
+    proxy_tpch(plans, mp, num, ids, t_start, ms)
     partial_executor(plans, num, ms, t_start)
 
+    fast_run_candidates(plans, meta, num, ids, ms, t_start)
     eligible = []
     if RUN_ENABLED:
         for p in plans:
@@ -1607,16 +1915,34 @@ def main():
     # keep them only for commits that look like mass failures.
     heavy_drop = {num[i] for i in DROP_HEAVY if i in num}
     for p in plans:
-        if heavy_drop & p[2] and not any(r.startswith(MASS_REASONS) for r in p[3]) and \
+        dropped = heavy_drop & p[2]
+        if dropped and not any(r.startswith(MASS_REASONS) for r in p[3]) and \
                 not any(r.startswith("table ") for r in p[3]):
-            p[2] = p[2] - heavy_drop
+            p[2] = p[2] - dropped
             p[3].append("heavy-drop")
-    for cid, _text, sel, reasons, _f in plans:
+            p[5][1] |= dropped
+    for cid, _text, sel, reasons, _f, bonus in plans:
         cost, ws = pack(sel, ms)
         if sel and all_cost - cost <= ALL_SLACK_MS:
             # the whole suite packs (almost) as cheaply: run it and leave nothing out
-            cost, ws = all_cost, all_ws
+            cost, ws = all_cost, [list(w) for w in all_ws]
             reasons.append("whole-suite")
+        if IDLE_FILL and len(ws) >= 2 and sel:
+            # Fill idle worker capacity with held-back candidates at zero simulated cost:
+            # never add a worker and never raise the critical path (max load).
+            loads = [sum(ms[t] for t in w) for w in ws]
+            cap = max(loads)
+            in_ws = {t for w in ws for t in w}
+            for tier in (bonus[0], bonus[1], bonus[2]):
+                for t in sorted((tier & set(ms)) - in_ws, key=lambda x: -ms[x]):
+                    fitting = [i for i in range(len(ws)) if loads[i] + ms[t] <= cap]
+                    if not fitting:
+                        continue
+                    i = min(fitting, key=lambda j: loads[j])
+                    ws[i].append(t)
+                    loads[i] += ms[t]
+                    in_ws.add(t)
+                    sel.add(t)
         px = [r for r in reasons if r.startswith("proxy")]
         log(f"{cid}: {len(sel)} tests, {cost/1000:.1f}s {' | '.join(px)} {'; '.join(r for r in reasons if r not in px)[:300]}")
         print(json.dumps({"commit": cid, "workers": ws}), flush=True)

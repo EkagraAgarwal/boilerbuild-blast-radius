@@ -33,12 +33,11 @@ print('sqlglot', top, sorted(os.listdir('/sqlglot')))" \
  && python -m compileall -q /sqlglot/sqlglot /sqlglot/tests \
  && chmod -R a+rX /sqlglot
 
-# Selector (+ runner.py when present) and the coverage map, world-readable.
-COPY *.py map.json.gz collect.json.gz querymap.json.gz table.json.gz /app/
-# Precompute statement indexes / string lines / identifier index of the pinned source and
-# convert the map to marshal, so the selector loads in milliseconds at run time.
-RUN rm -f /app/score.py && python /app/build_index.py /sqlglot /app/index.marshal /app/map.json.gz \
- && python /app/mk_table.py /app/table.json.gz /app/table.marshal \
- && python -m compileall -q /app && chmod -R a+rX /app
+# Build index + mutant table BEFORE copying selector code so code edits rebuild in ~1s.
+COPY build_index.py mk_table.py map.json.gz collect.json.gz querymap.json.gz table.json.gz /app/
+RUN python /app/build_index.py /sqlglot /app/index.marshal /app/map.json.gz \
+ && python /app/mk_table.py /app/table.json.gz /app/table.marshal
+COPY selector.py runner.py partial.py tpcds_proxy.py regdiff.py /app/
+RUN python -m compileall -q /app && chmod -R a+rX /app
 
 CMD ["python", "/app/selector.py"]

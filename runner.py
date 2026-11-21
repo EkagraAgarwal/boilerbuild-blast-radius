@@ -378,6 +378,7 @@ def build_tree(src_root, changes, tree=TREE):
 _ZYGOTE = r'''
 import gc, json, os, resource, signal, sys
 tree, preload = sys.argv[1], sys.argv[2]
+lite = len(sys.argv) > 3 and sys.argv[3] == "1"
 sys.path[:] = [tree] + [p for p in sys.path if p not in ("", ".", tree)]
 os.chdir(tree)
 
@@ -387,14 +388,18 @@ def _try(m):
     except BaseException:
         pass
 
-for m in ("unittest", "unittest.mock", "json", "sqlite3", "tempfile", "decimal", "datetime",
-          "importlib", "concurrent.futures", "concurrent.futures.process", "multiprocessing",
-          "multiprocessing.context", "multiprocessing.popen_fork", "numpy", "pandas",
-          "pandas.testing", "duckdb"):
-    _try(m)
-if preload == "1":
-    for m in ("sqlglot", "sqlglot.optimizer", "sqlglot.executor", "sqlglot.planner"):
+if lite:
+    for m in ("unittest", "unittest.mock", "json", "tempfile", "decimal", "datetime", "importlib"):
         _try(m)
+else:
+    for m in ("unittest", "unittest.mock", "json", "sqlite3", "tempfile", "decimal", "datetime",
+              "importlib", "concurrent.futures", "concurrent.futures.process", "multiprocessing",
+              "multiprocessing.context", "multiprocessing.popen_fork", "numpy", "pandas",
+              "pandas.testing", "duckdb"):
+        _try(m)
+    if preload == "1":
+        for m in ("sqlglot", "sqlglot.optimizer", "sqlglot.executor", "sqlglot.planner"):
+            _try(m)
 os.chdir("/")
 import importlib, tempfile, unittest
 gc.collect()
@@ -565,8 +570,8 @@ while True:
 
 
 class _Zygote:
-    def __init__(self, src_root, preload, dwb):
-        self.src_root, self.preload, self.dwb = src_root, preload, dwb
+    def __init__(self, src_root, preload, dwb, lite=False):
+        self.src_root, self.preload, self.dwb, self.lite = src_root, preload, dwb, lite
         env = dict(os.environ)
         env.pop("PYTHONPATH", None)
         env["SKIP_INTEGRATION"] = "0"
@@ -580,7 +585,7 @@ class _Zygote:
         env.setdefault("HOME", "/tmp")
         self.buf = b""
         self.proc = subprocess.Popen(
-            [sys.executable, "-c", _ZYGOTE, TREE, "1" if preload else "0"],
+            [sys.executable, "-c", _ZYGOTE, TREE, "1" if preload else "0", "1" if lite else "0"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             env=env, cwd="/", bufsize=0, close_fds=True,
         )
@@ -628,11 +633,24 @@ class _Zygote:
 
 
 _Z = None
+_Z_LITE = None
 _STATS = {"calls": 0, "zygote_starts": 0, "startup_cpu_s": 0.0}
 
 
-def _zygote(src_root):
-    global _Z
+def _zygote(src_root, lite=False):
+    global _Z, _Z_LITE
+    if lite:
+        if _Z_LITE is not None and _Z_LITE.proc.poll() is not None:
+            _Z_LITE.close()
+            _Z_LITE = None
+        if _Z_LITE is None:
+            os.makedirs(TREE, exist_ok=True)  # _ZYGOTE chdirs here; nothing is preloaded from src_root
+            info = _src_info(src_root)
+            _Z_LITE = _Zygote(src_root, preload=False, dwb=info["prebuilt"], lite=True)
+            _STATS["zygote_starts"] += 1
+            _STATS["startup_cpu_s"] += _Z_LITE.startup_cpu
+            return _Z_LITE, _Z_LITE.startup_cpu
+        return _Z_LITE, 0.0
     info = _src_info(src_root)
     if _Z is not None and (_Z.src_root != src_root or _Z.proc.poll() is not None):
         _Z.close()
@@ -664,8 +682,8 @@ def _kill_group(pid):
             pass
 
 
-def run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, _fork_pool=True):
-    global _Z
+def run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, _fork_pool=True, lite=False):
+    global _Z, _Z_LITE
     t_wall = time.monotonic()
     s0, c0 = _cpu_self(), _cpu_children()
     ids = list(dict.fromkeys(test_ids))
@@ -688,7 +706,7 @@ def run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, _fork_p
     out = os.path.join(RUN_DIR, "result.json")
     pid = None
     try:
-        z, startup = _zygote(src_root)
+        z, startup = _zygote(src_root, lite=lite)
         detail["startup"] = startup
         build_tree(src_root, changes)
         _rmtree(out)
@@ -719,9 +737,14 @@ def run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, _fork_p
     except Exception as e:  # zygote broken: restart on next call
         if pid:
             _kill_group(pid)
-        if _Z is not None:
-            _Z.close()
-            _Z = None
+        if lite:
+            if _Z_LITE is not None:
+                _Z_LITE.close()
+                _Z_LITE = None
+        else:
+            if _Z is not None:
+                _Z.close()
+                _Z = None
         return finish(ids, False, f"runner: {type(e).__name__}: {e}")
 
 
@@ -730,10 +753,13 @@ def stats():
 
 
 def shutdown(clear_cache=True):
-    global _Z
+    global _Z, _Z_LITE
     if _Z is not None:
         _Z.close()
         _Z = None
+    if _Z_LITE is not None:
+        _Z_LITE.close()
+        _Z_LITE = None
     _rmtree(RUN_DIR)
     if clear_cache:
         _rmtree(PYC_DIR)
