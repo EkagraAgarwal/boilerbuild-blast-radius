@@ -563,13 +563,13 @@ def _may_raise_at_import(f, stmts, src):
         lo, hi, kind, nlo, nhi, in_func = s
         if kind in ("FunctionDef", "AsyncFunctionDef", "ClassDef"):
             if nlo <= ln <= nhi and ln in f["changed"]:
-                return True  # header (name, decorators, bases, defaults) of a def/class
+                return "header"  # header (name, decorators, bases, defaults) of a def/class
             continue
         if in_func:
             continue
         if calls_changed and (any(_eager_call(l) for l in added_code + removed_code)
                               or _eager_call("\n".join(src[lo - 1:hi]))):
-            return True  # a call that runs at import time was added, removed or changed
+            return "call"  # a call that runs at import time was added, removed or changed
     return False
 
 
@@ -844,13 +844,17 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
                 else:
                     reasons.append(f"apply-failed {old}")
             if IMPORT_FAIL and old.startswith("sqlglot/") and any(
-                    re.match(r"(from|import)\s", l) for l in f["added"] + f["removed"]):
+                    re.match(r"(from|import)\s", l) for l in f["added"] + f["removed"]) and not (
+                    old in IMPORT_OK and not _removed_import_names_used(f, src, patch_text)):
                 # an added/removed top-level import can make the whole module fail to import
+                # (skipped once the patched module and its importers were seen to import cleanly
+                # and no name a removed import bound is still referenced)
                 hit = import_failure_tests(mp, old)
                 sel |= all_tests if hit is None else hit
                 reasons.append(f"toplevel-import {old} -> {'all' if hit is None else len(hit)}")
             stmts = stmt_index(old, src)
-            if IMPORT_FAIL and old.startswith("sqlglot/") and src and _may_raise_at_import(f, stmts, src):
+            risk = IMPORT_FAIL and old.startswith("sqlglot/") and src and _may_raise_at_import(f, stmts, src)
+            if risk and not (risk == "call" and old in IMPORT_OK):
                 # an edit to code that runs while the module imports (a call in a class body, a
                 # renamed/deleted top-level def) can make the import raise: every user breaks
                 hit = import_failure_tests(mp, old)
@@ -936,6 +940,34 @@ _DIAL = []
 
 
 IMPORT_FAIL = os.environ.get("BR_IMPORT_FAIL", "1") == "1"
+# modules whose patched version (and every module importing it) imported cleanly at run time, for
+# the commit being re-planned; see verify_imports
+IMPORT_OK = set()
+
+
+def _removed_import_names_used(f, src, patch_text):
+    """Does the patched module still reference a name that a removed import line bound?"""
+    names = set()
+    for l in f["removed"]:
+        m = re.match(r"\s*from\s+\S+\s+import\s+(.+)", l) or re.match(r"\s*import\s+(.+)", l)
+        if not m:
+            continue
+        for part in m.group(1).replace("(", " ").replace(")", " ").split(","):
+            part = part.strip()
+            if not part or part == "\\":
+                continue
+            bits = part.split()
+            nm = bits[-1] if len(bits) >= 3 and bits[-2] == "as" else bits[0].split(".")[0]
+            names.add(nm)
+    if not names:
+        return False
+    new = apply_hunks(src, patch_text, f["new"]) if src is not None else None
+    if new is None:
+        return True
+    body = "\n".join(_code_part(l) for l in new if not re.match(r"\s*(from|import)\s", l))
+    return any(re.search(r"\b%s\b" % re.escape(n), body) for n in names)
+
+
 _IMP = []
 
 
@@ -1099,6 +1131,95 @@ def mentioning_tests(rel, tests_by_file):
 
 
 ALL_SLACK_MS = int(os.environ.get("BR_ALL_SLACK_MS", "500"))
+
+# ---------------------------------------------------------------- import check at run time
+# The import-risk / top-level-import rules only guard against the patched module (or a module
+# importing it) failing to import. Importing them on the patched tree settles that for ~0.5 s CPU.
+VERIFY_IMPORTS = os.environ.get("BR_VERIFY_IMPORTS", "1") == "1"
+VERIFY_CPU_EST_MS = 700
+_IMPORT_CHECK = r'''
+import importlib, sys
+sys.path.insert(0, sys.argv[1])
+import sqlglot
+for m in sys.argv[2:]:
+    importlib.import_module(m)
+'''
+
+
+def _import_rules_rels(reasons):
+    out = set()
+    for r in reasons:
+        if r.startswith(("import-risk ", "toplevel-import ")):
+            out.add(r.split(" ", 2)[1])
+    return out
+
+
+def verify_imports(plans, mp, tests_by_file, ms, t_start):
+    if not VERIFY_IMPORTS:
+        return
+    todo = []
+    for p in plans:
+        rels = _import_rules_rels(p[3])
+        if not rels or any(r.startswith(("SYNTAX", "apply-failed", "error")) for r in p[3]):
+            continue
+        IMPORT_OK.clear()
+        IMPORT_OK.update(rels)
+        try:
+            sel2, reasons2 = candidates(mp, p[4], tests_by_file, p[1], set(ms))
+        except Exception:  # noqa: BLE001
+            continue
+        finally:
+            IMPORT_OK.clear()
+        sel2 &= set(ms)
+        if pack(p[2], ms)[0] - pack(sel2, ms)[0] > VERIFY_CPU_EST_MS:
+            todo.append((p, rels, sel2, reasons2))
+    if not todo:
+        return
+    try:
+        import runner
+        import shutil
+        import subprocess
+    except Exception as ex:  # noqa: BLE001
+        log(f"import check: runner unavailable {ex!r}")
+        return
+    b = load_index().get("imports")
+    if b is None:
+        return
+    import marshal
+    d = marshal.loads(b)
+    for p, rels, sel2, reasons2 in todo:
+        if time.monotonic() - t_start > 100:
+            p[3].append("import check: skipped (time)")
+            continue
+        mods = set()
+        for rel in rels:
+            for m in {rel} | set(d["importers"].get(rel, ())):
+                if m.endswith(".py"):
+                    m = m[:-3]
+                    if m.endswith("/__init__"):
+                        m = m[: -len("/__init__")]
+                    mods.add(m.replace("/", "."))
+        ok, why = False, ""
+        try:
+            changes = runner.apply_patch(p[1], str(SRC))
+            if os.path.exists(runner.RUN_DIR):
+                shutil.rmtree(runner.RUN_DIR, ignore_errors=True)
+            os.makedirs(runner.RUN_DIR, exist_ok=True)
+            runner.build_tree(str(SRC), changes)
+            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+            r = subprocess.run([sys.executable, "-I", "-c", _IMPORT_CHECK, runner.TREE] + sorted(mods),
+                               env=env, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                               text=True, cwd=runner.RUN_DIR)
+            ok = r.returncode == 0
+            why = "" if ok else (r.stderr.strip().splitlines() or ["failed"])[-1][:80]
+        except Exception as ex:  # noqa: BLE001
+            why = f"error {ex!r}"[:80]
+        finally:
+            shutil.rmtree(runner.RUN_DIR, ignore_errors=True)
+        if ok:
+            p[2], p[3] = sel2, reasons2 + [f"import check: {len(mods)} modules import cleanly"]
+        else:
+            p[3].append(f"import check: failed ({why})")
 
 
 def pack(tests, ms):
@@ -1313,6 +1434,7 @@ def main():
         sel &= set(ms)
         plans.append([stem, text, sel, reasons, files])
 
+    verify_imports(plans, mp, tests_by_file, ms, t_start)
     proxy_tpcds(plans, mp, num, ids, t_start, ms)
 
     eligible = []
