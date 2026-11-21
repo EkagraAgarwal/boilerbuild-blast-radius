@@ -45,8 +45,11 @@ jobs:
           nproc
       - name: label
         run: |
+          FIRST=data/priority_ids.txt; EXTRA=""
+          if [ -f data/round.env ]; then set -a; . ./data/round.env; set +a; fi
+          echo "FIRST=$FIRST EXTRA=$EXTRA LT_ONLY=${LT_ONLY:-}"
           python /tools/label_table.py --out /work/allmut/labels.jsonl --jobs 4 --order ratio \
-            --first data/priority_ids.txt --shard ${{ matrix.shard }}/20 --deadline-s ${DEADLINE:-6000} --max-label-ms 300000 || true
+            --first $FIRST --shard ${{ matrix.shard }}/20 --deadline-s ${DEADLINE:-6000} --max-label-ms 300000 $EXTRA || true
           grep -v '"status": "seed"' /work/allmut/labels.jsonl > labels-${{ matrix.shard }}.jsonl || true
           wc -l labels-${{ matrix.shard }}.jsonl
       - uses: actions/upload-artifact@v4
