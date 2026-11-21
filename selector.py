@@ -1188,6 +1188,12 @@ def mentioning_tests(rel, tests_by_file):
 
 
 ALL_SLACK_MS = int(os.environ.get("BR_ALL_SLACK_MS", "500"))
+DROP_HEAVY = [i for i in os.environ.get(
+    "BR_DROP_HEAVY", "tests/test_parser.py::TestParser::test_max_nodes,"
+    "tests/test_generator.py::TestGenerator::test_generator_memory").split(",") if i]
+MASS_REASONS = ("SYNTAX", "apply-failed", "error", "collection", "import-fail", "import-risk", "toplevel-import",
+                "importtime-import", "deleted", "renamed", "conftest", "pytest-config", "cached", "whole-suite",
+                "binary", "repo-file")
 NARROW_SQL_OVERRIDE = os.environ.get("BR_NARROW_SQL", "1") == "1"
 
 # ---------------------------------------------------------------- partial executor replay
@@ -1597,6 +1603,14 @@ def main():
             pass
 
     all_cost, all_ws = pack(set(ms), ms)
+    # Heavy tests that (on ~24k labeled mutants) almost only fail when nearly everything fails:
+    # keep them only for commits that look like mass failures.
+    heavy_drop = {num[i] for i in DROP_HEAVY if i in num}
+    for p in plans:
+        if heavy_drop & p[2] and not any(r.startswith(MASS_REASONS) for r in p[3]) and \
+                not any(r.startswith("table ") for r in p[3]):
+            p[2] = p[2] - heavy_drop
+            p[3].append("heavy-drop")
     for cid, _text, sel, reasons, _f in plans:
         cost, ws = pack(sel, ms)
         if sel and all_cost - cost <= ALL_SLACK_MS:
