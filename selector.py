@@ -918,11 +918,11 @@ def import_failure_tests(mp, rel):
         return None
     out = set()
     for m in broken:
-        out |= set(mp.file_tests(m))  # runtime users (lazy imports inside tests)
+        out |= set(mp.file_tests(m) or ())  # runtime users (lazy imports inside tests)
         out |= dialect_dependents(m)  # tests naming a dialect that loads it
     for m in broken:
         for f, ln in d.get("lazy", {}).get(m, ()):
-            out |= set(mp.line_tests(f, ln))  # tests that ran an import of it (also inside functions)
+            out |= set(mp.line_tests(f, ln) or ())  # tests that ran an import of it (also inside functions)
     for tf, mods in d["testmods"].items():
         if broken & set(mods):
             out |= set(TESTS_BY_FILE.get(tf, []))  # the test module itself fails to import
