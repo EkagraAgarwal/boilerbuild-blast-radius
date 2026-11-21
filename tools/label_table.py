@@ -119,10 +119,20 @@ def collect_of(out):
     return read_label(out)[1]
 
 
+MEM_MB = int(os.environ.get("LT_MEM_MB", "0"))
+
+
+def _limit_mem():
+    """Cap each process's address space so one runaway mutant can't take the whole runner down."""
+    if MEM_MB:
+        import resource
+        resource.setrlimit(resource.RLIMIT_AS, (MEM_MB << 20, MEM_MB << 20))
+
+
 def run_group(cmd, env, limit):
     """Run cmd in its own session; kill the group on timeout. -> (returncode, 'ok'|'timeout')."""
     proc = subprocess.Popen(cmd, cwd=WORK_DIR, env=env, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, start_new_session=True)
+                            stderr=subprocess.DEVNULL, start_new_session=True, preexec_fn=_limit_mem)
     try:
         proc.wait(timeout=limit)
         return proc.returncode, "ok"
