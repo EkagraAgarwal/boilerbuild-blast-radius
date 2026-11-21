@@ -339,6 +339,26 @@ def apply_hunks(old_lines, patch_text, rel):
     return out
 
 
+def _code_part(line):
+    """The line without a trailing # comment (a # inside a string literal is kept), stripped."""
+    q = None
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if q:
+            if c == "\\":
+                i += 2
+                continue
+            if c == q:
+                q = None
+        elif c in "\"'":
+            q = c
+        elif c == "#":
+            return line[:i].strip()
+        i += 1
+    return line.strip()
+
+
 def fast_same(rel, f, src, new):
     """Like ast_same but avoids parsing/dumping whole files when the edit is clearly
     comment/blank-only, and only syntax-checks the new text when real code changed."""
@@ -350,8 +370,9 @@ def fast_same(rel, f, src, new):
         cont = any(1 <= i <= len(src) and src[i - 1].rstrip().endswith("\\") for i in f["ins"])
         if not (touch & strl) and not cont:
             return True
-    norm_old = [l.strip() for l in f["removed"] if not is_trivial(l)]
-    norm_new = [l.strip() for l in f["added"] if not is_trivial(l)]
+    # code lines with their trailing comments removed: a comment appended to a code line is no change
+    norm_old = [_code_part(l) for l in f["removed"] if not is_trivial(l)]
+    norm_new = [_code_part(l) for l in f["added"] if not is_trivial(l)]
     if trivial or "".join(norm_old).replace(" ", "") == "".join(norm_new).replace(" ", ""):
         return ast_same("\n".join(src), "\n".join(new))  # reformatting: compare properly
     try:
