@@ -1132,6 +1132,74 @@ def mentioning_tests(rel, tests_by_file):
 
 ALL_SLACK_MS = int(os.environ.get("BR_ALL_SLACK_MS", "500"))
 
+# ---------------------------------------------------------------- partial executor replay
+# TestExecutor's TPC tests run ~100 fixture queries each. When the patch's changed lines are run by
+# only a few of them (per-query coverage map of the pinned commit) and by none of the shared setup,
+# replaying just those queries against the patched tree (partial.verify) decides the whole test.
+PARTIAL_ON = os.environ.get("BR_PARTIAL", "0") == "1"  # off: no gain on the labeled sets
+PARTIAL_BUDGET_S = float(os.environ.get("BR_PARTIAL_BUDGET", "45"))
+PARTIAL_STARTUP_S = 2.0  # fork server start-up (numpy/pandas/duckdb import), paid once
+PARTIAL_UNSAFE = ("SYNTAX", "apply-failed", "error", "collection", "cached", "conftest", "deleted", "renamed",
+                  "binary", "repo-file", "unmapped", "pytest-config", "read-as-data", "import-fail",
+                  "import-risk", "toplevel-import", "whole-suite")
+
+
+def partial_executor(plans, num, ms, t_start):
+    if not PARTIAL_ON:
+        return
+    try:
+        import partial as _partial
+        qm = _partial.load_querymap()
+    except Exception as ex:  # noqa: BLE001
+        log(f"partial: unavailable {ex!r}")
+        return
+    spent, started = 0.0, False
+    # biggest savings first
+    order = []
+    for p in plans:
+        if any(r.startswith(PARTIAL_UNSAFE) for r in p[3]):
+            continue
+        for which, tid in _partial.TEST_IDS.items():
+            k = num.get(tid)
+            if k is None or k not in p[2]:
+                continue
+            saving = (pack(p[2], ms)[0] - pack(p[2] - {k}, ms)[0]) / 1000
+            if saving > 1.0:
+                order.append((saving, which, k, p))
+    order.sort(key=lambda x: -x[0])
+    for saving, which, k, p in order:
+        if k not in p[2]:
+            continue
+        saving = (pack(p[2], ms)[0] - pack(p[2] - {k}, ms)[0]) / 1000
+        if time.monotonic() - t_start > 110 or spent > PARTIAL_BUDGET_S:
+            p[3].append(f"partial {which}: skipped (budget)")
+            continue
+        try:
+            a = _partial.analyze(p[1], qm, which, str(SRC))
+        except Exception as ex:  # noqa: BLE001
+            p[3].append(f"partial {which}: analyze failed {ex!r}"[:80])
+            continue
+        if a["touches_setup"] or not a["indices"] or a.get("est_cpu") is None:
+            p[3].append(f"partial {which}: not applicable ({a.get('reason') or 'no query runs the change'})")
+            continue
+        est = a["est_cpu"] * 1.3 + (0 if started else PARTIAL_STARTUP_S)
+        if saving <= est + 0.5:
+            p[3].append(f"partial {which}: not worth it ({len(a['indices'])} queries, est {est:.1f}s >= {saving:.1f}s)")
+            continue
+        r = _partial.verify(p[1], which, a["indices"], src_root=str(SRC), timeout_s=40)
+        started = True
+        spent += r.get("cpu_s", 0.0)
+        if r["ok"] and not r["failed"]:
+            p[2] = p[2] - {k}
+            p[3].append(f"partial {which}: {len(a['indices'])} queries passed -> dropped ({r['cpu_s']:.2f}s)")
+        else:
+            p[3].append(f"partial {which}: kept ({'failed' if r['ok'] else r.get('error')}, {r.get('cpu_s', 0):.2f}s)"[:120])
+    try:
+        _partial.shutdown()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ---------------------------------------------------------------- import check at run time
 # The import-risk / top-level-import rules only guard against the patched module (or a module
 # importing it) failing to import. Importing them on the patched tree settles that for ~0.5 s CPU.
@@ -1436,6 +1504,7 @@ def main():
 
     verify_imports(plans, mp, tests_by_file, ms, t_start)
     proxy_tpcds(plans, mp, num, ids, t_start, ms)
+    partial_executor(plans, num, ms, t_start)
 
     eligible = []
     if RUN_ENABLED:
