@@ -605,7 +605,38 @@ def _may_raise_at_import(f, stmts, src):
         if calls_changed and (any(_eager_call(l) for l in added_code + removed_code)
                               or _eager_call("\n".join(src[lo - 1:hi]))):
             return "call"  # a call that runs at import time was added, removed or changed
+        if IMPORT_RISK_NONLITERAL and _nonliteral_change(removed_code, added_code):
+            return "call"  # an operator / name / attribute in import-time code changed (e.g. set - -> +)
     return False
+
+
+IMPORT_RISK_NONLITERAL = os.environ.get("BR_RISK_NONLIT", "1") == "1"
+
+
+def _shape(lines):
+    """Token multiset of these lines with literal values (numbers, strings, True/False/None) blanked."""
+    import io
+    import tokenize
+    out = []
+    for l in lines:
+        try:
+            toks = list(tokenize.generate_tokens(io.StringIO(_code_part(l).strip() + "\n").readline))
+        except (tokenize.TokenError, IndentationError, SyntaxError):
+            out.append(("RAW", l.strip()))
+            continue
+        for t in toks:
+            if t.type in (tokenize.NEWLINE, tokenize.NL, tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER,
+                          tokenize.COMMENT):
+                continue
+            if t.type in (tokenize.NUMBER, tokenize.STRING) or t.string in ("True", "False", "None"):
+                out.append(("LIT", ""))
+            else:
+                out.append((str(t.type), t.string))
+    return sorted(out)
+
+
+def _nonliteral_change(removed_code, added_code):
+    return _shape(removed_code) != _shape(added_code)
 
 
 def _call_snippets(lines):
@@ -764,6 +795,14 @@ def line_candidates(mp, rel, src, stmts, ln):
         m = re.match(r"\s*class\s+(\w+)", src[best[3] - 1])
         if m:
             cls_users = name_users(mp, m.group(1)) | mp.range_tests(rel, best[3], best[4])
+            if SUBCLASS_ON:
+                # class attributes are inherited: every subclass's users see the edit
+                subs = subclasses_of(m.group(1))
+                if len(subs) > SUBCLASS_ALL:
+                    cls_users = cls_users | set(TEST_NUM.values())
+                else:
+                    for sc in subs:
+                        cls_users = cls_users | name_users(mp, sc)
             t = t | cls_users
             if "arg_types" in names and m.group(1) in IMPORT_PARSED:
                 # the DuckDB generator parses SQL in its class body: a newly required arg of a class
@@ -779,15 +818,115 @@ def line_candidates(mp, rel, src, stmts, ln):
         # import (NameError in its class bodies): every test naming a dialect that loads it breaks
         dep = dialect_dependents(rel)
         return fam | dep | t, f"importtime-import[{','.join(sorted(names))}|fam+{len(dep)}]"
+    owner = None
+    if best is not None:
+        m_ = re.match(r"\s*class\s+(\w+)", src[best[3] - 1])
+        owner = m_.group(1) if m_ else None
+    # (dialect-family inner classes are all named Parser/Tokenizer/Generator: `Parser.X` can't be told
+    # apart from the base class, and the dialect scope rules cover their subclasses)
+    spread = (import_time_spread(mp, rel, names, lo, hi, owner)
+              if SPREAD_ON and names and not (owner is not None and family_module) else set())
+    t = t | spread
     if users and fam:
         cand = users & fam
         if cand:
-            return cand | t, f"importtime[{','.join(sorted(names))}&fam]"
+            return cand | t, f"importtime[{','.join(sorted(names))}&fam{'+spread' if spread else ''}]"
     if users:
         return users | t, f"importtime[{','.join(sorted(names))}]"
     if fam:
         return fam | t, "importtime[fam]"
     return mp.file_tests(rel) | t, "importtime[file]"
+
+
+SUBCLASS_ON = os.environ.get("BR_SUBCLASS", "1") == "1"
+SUBCLASS_ALL = 40
+_SUBS = {}
+
+
+def subclasses_of(name):
+    """Transitive subclasses (by class name) of `name` among sqlglot's non-dialect modules."""
+    if not _SUBS:
+        kids = {}
+        pat = re.compile(r"^\s*class\s+(\w+)\s*\(([^)]*)\)", re.M)
+        for r in (MAP_REF[0].lines if MAP_REF else ()):
+            if not (r.startswith("sqlglot/") and r.endswith(".py")):
+                continue
+            txt = _SRC_TEXT.get(r)
+            if txt is None:
+                txt = _SRC_TEXT[r] = "\n".join(source_lines(r) or [])
+            for m in pat.finditer(txt):
+                for b in m.group(2).split(","):
+                    b = b.strip().split("[")[0].split(".")[-1]
+                    if b.isidentifier():
+                        kids.setdefault(b, set()).add(m.group(1))
+        _SUBS["k"] = kids
+    kids = _SUBS["k"]
+    out, todo = set(), [name]
+    while todo:
+        for c in kids.get(todo.pop(), ()):
+            if c not in out and c != name:
+                out.add(c)
+                todo.append(c)
+    return out
+
+
+SPREAD_ON = os.environ.get("BR_SPREAD", "1") == "1"
+_SRC_TEXT = {}
+
+
+def import_time_spread(mp, rel, names, lo, hi, owner=None):
+    """A module/class-level name read by other import-time code (e.g. **QUERY_MODIFIERS spread into
+    several arg_types) carries the edit into those definitions: tests using the classes (or
+    modules) whose bodies read it. Only references to this very definition count: `Owner.NAME`
+    for a class attribute; for a module-level name, the bare name in its own module or
+    `module.NAME` / an import of it elsewhere."""
+    names = [n for n in names if len(n) > 2]
+    if not names:
+        return set()
+    stem = _stem(rel)
+    out = set()
+    for r in mp.lines:
+        if not (r.startswith("sqlglot/") and r.endswith(".py")):
+            continue
+        txt = _SRC_TEXT.get(r)
+        if txt is None:
+            txt = _SRC_TEXT[r] = "\n".join(source_lines(r) or [])
+        if owner is not None:
+            pats = [re.compile(r"\b" + re.escape(owner) + r"\." + re.escape(n) + r"\b") for n in names]
+        elif r == rel:
+            pats = [re.compile(r"(?<![.\w])" + re.escape(n) + r"\b") for n in names]
+        else:
+            if not re.search(r"\b" + re.escape(stem) + r"\b", txt):
+                continue
+            pats = [re.compile(r"\b" + re.escape(stem) + r"\." + re.escape(n) + r"\b") for n in names]
+            # `from <this module> import (..., NAME, ...)` (also multi-line / relative): bare uses count
+            modpat = r"(?:" + re.escape(rel[:-3].replace("/", ".")) + r"|\.+" + re.escape(stem) + r")"
+            for n in names:
+                if re.search(r"from\s+" + modpat + r"\s+import\s+\(?[^)]*?\b" + re.escape(n) + r"\b", txt, re.S):
+                    pats.append(re.compile(r"(?<![.\w])" + re.escape(n) + r"\b"))
+        if not any(p.search(txt) for p in pats):
+            continue
+        src = source_lines(r) or []
+        st = stmt_index(r, src)
+        for i, l in enumerate(src, 1):
+            if r == rel and lo <= i <= hi:
+                continue
+            if not any(p.search(_code_part(l)) for p in pats):
+                continue
+            s = innermost(st, i)
+            if s is None or s[5] or s[2] in ("FunctionDef", "AsyncFunctionDef"):
+                continue  # inside a function: runs at call time (line coverage handles it)
+            best = None
+            for c in st:
+                if c[2] == "ClassDef" and c[3] <= i <= c[4] and (best is None or c[3] > best[3]):
+                    best = c
+            if best is not None:
+                m = re.match(r"\s*class\s+(\w+)", src[best[3] - 1])
+                if m:
+                    out |= name_users(mp, m.group(1)) | mp.range_tests(r, best[3], best[4])
+                    continue
+            out |= mp.file_tests(r)
+    return out
 
 
 # ---------------------------------------------------------------- selection
