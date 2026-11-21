@@ -1270,13 +1270,9 @@ def main():
             rem = [l for l in f["removed"] if not is_trivial(l)]
             add = [l for l in f["added"] if not is_trivial(l)]
             return f["old"].startswith("sqlglot/") and len(rem) == 1 and len(add) == 1
-        # probe 2c: commits whose unresolved edits are one-line changes in sqlglot/ (replace, delete or insert)
-        def _one_line(f):
-            rem = [l for l in f["removed"] if not is_trivial(l)]
-            add = [l for l in f["added"] if not is_trivial(l)]
-            return f["old"].startswith("sqlglot/") and len(rem) <= 1 and len(add) <= 1 and (rem or add)
-        if unresolved and all(_one_line(f) for f in _f.values() if f["old"] in unresolved):
-            sel = set()
+        # probe 3: unresolved commits keep their selection minus heavy tests (> 3 s)
+        if unresolved:
+            sel = {t for t in sel if ms[t] <= 3000}
         cost, ws = pack(sel, ms)
         px = [r for r in reasons if r.startswith("proxy")]
         log(f"{cid}: {len(sel)} tests, {cost/1000:.1f}s {' | '.join(px)} {'; '.join(r for r in reasons if r not in px)[:300]}")
