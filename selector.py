@@ -636,11 +636,19 @@ def line_candidates(mp, rel, src, stmts, ln):
         if m:
             cls_users = name_users(mp, m.group(1)) | mp.range_tests(rel, best[3], best[4])
             t = t | cls_users
+            if "arg_types" in names and m.group(1) in IMPORT_PARSED:
+                # the DuckDB generator parses SQL in its class body: a newly required arg of a class
+                # built there makes `import sqlglot.dialects.duckdb` raise for every DuckDB user
+                t = t | duckdb_users(mp)
     # the module's own test file (dialects/dremio.py -> tests/dialects/test_dremio.py)
     own = f"test_{_stem(rel)}.py"
     for fl, ks in TESTS_BY_FILE.items():
         if fl.rsplit("/", 1)[-1] == own:
             t = t | set(ks)
+    if fam and IMPORT_NAMES.match(src[lo - 1]):
+        # an edited/removed import of a dialect-family module can make the whole module fail to
+        # import (NameError in its class bodies): every user of the family breaks
+        return users & fam | fam | t, f"importtime-import[{','.join(sorted(names))}|fam]"
     if users and fam:
         cand = users & fam
         if cand:
@@ -801,6 +809,42 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
 
 
 _COLLECT = None
+
+# expression classes validated by the parser while `sqlglot.dialects.duckdb` imports (the only
+# dialect that parses SQL at import time, in DuckDBGenerator's class body)
+IMPORT_PARSED = {
+    "Abs", "Add", "Alias", "And", "Anonymous", "ArrayContains", "ArraySize", "Between", "BitwiseAnd",
+    "BitwiseOr", "BitwiseRightShift", "Bracket", "CTE", "Case", "Cast", "Coalesce", "Column", "Concat",
+    "Cos", "Count", "DPipe", "Distinct", "Div", "EQ", "Encode", "Filter", "From", "GT", "GTE",
+    "GenerateSeries", "Greatest", "Group", "If", "Is", "JSONExtract", "JSONKeyValue", "JSONObject", "Join",
+    "LT", "LTE", "Lambda", "Length", "List", "Ln", "Lower", "MapFromEntries", "MapKeys", "Min", "Mod", "Mul",
+    "NEQ", "Neg", "Not", "Null", "NullSafeEQ", "Or", "Order", "Ordered", "Paren", "Pi", "Placeholder", "Pow",
+    "PropertyEQ", "Repeat", "Replace", "RowNumber", "SHA", "Select", "Slice", "Sqrt", "Star", "Sub",
+    "Subquery", "Substring", "Sum", "Table", "TableAlias", "Unhex", "Unnest", "Where", "Window", "With"}
+_DUCK = []
+
+
+def duckdb_users(mp):
+    """Every test that loads the DuckDB dialect: runtime users of its modules plus every test in a
+    test file whose collection imports it."""
+    if _DUCK:
+        return _DUCK[0]
+    out = set()
+    for f in ("sqlglot/dialects/duckdb.py", "sqlglot/generators/duckdb.py", "sqlglot/parsers/duckdb.py",
+              "sqlglot/tokenizers/duckdb.py", "sqlglot/typing/duckdb.py"):
+        out |= set(mp.file_tests(f))
+    global _COLLECT
+    if _COLLECT is None:
+        p = os.path.join(HERE, "collect.json.gz")
+        _COLLECT = json.loads(gzip.decompress(open(p, "rb").read())) if os.path.exists(p) else {}
+    cl = (_COLLECT.get("lines") or {}).get("sqlglot/generators/duckdb.py") or {}
+    files = set()
+    for g in set(cl.values()):
+        files.update(_COLLECT["files"][i] for i in _COLLECT["groups"][g])
+    for fl in files:
+        out |= set(TESTS_BY_FILE.get(fl, []))
+    _DUCK.append(out)
+    return out
 
 
 def collection_files(rel, stmts, touched):
