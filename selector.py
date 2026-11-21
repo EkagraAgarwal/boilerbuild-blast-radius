@@ -370,6 +370,32 @@ def fast_same(rel, f, src, new):
 
 
 EQUIV = os.environ.get("BR_EQUIV", "1") == "1"
+TABLE_ON = os.environ.get("BR_TABLE", "1") == "1"
+TABLE_PATH = os.environ.get("BR_TABLE_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "table.marshal"))
+_table = []
+
+
+def table_lookup(rel, f):
+    """Precomputed single-token mutants: (file, old line no, new line) -> exact failing tests.
+    Only for an edit that replaces exactly one code line (other added lines must be comments)."""
+    rem = [l for l in f["removed"] if not is_trivial(l)]
+    add = [l for l in f["added"] if not is_trivial(l)]
+    if len(rem) != 1 or len(add) != 1 or len(f["changed"]) != 1 or len(f["removed"]) != 1:
+        return None
+    if any(l.strip() and not l.strip().startswith("#") for l in f["added"] if l is not add[0]):
+        return None
+    if not _table:
+        try:
+            import marshal
+            with open(TABLE_PATH, "rb") as fh:
+                _table.append(marshal.load(fh))
+        except Exception:  # noqa: BLE001
+            _table.append({})
+    (ln,) = f["changed"]
+    v = _table[0].get(f"{rel}\t{ln}\t{add[0]}")
+    if v is None or v[0] != rem[0]:
+        return None
+    return set(v[1])
 _EQ_HINT = re.compile(r"\bis\b|==|!=")
 
 
@@ -382,11 +408,15 @@ def _singleton(node):
     import ast
     if isinstance(node, ast.Constant):
         return node.value is None
-    if isinstance(node, ast.Attribute) and node.attr.isupper() and len(node.attr) > 1:
+    if isinstance(node, ast.Attribute) and node.attr.isupper():
         v = node.value
         base = v.id if isinstance(v, ast.Name) else v.attr if isinstance(v, ast.Attribute) else ""
-        return base[:1].isupper() and not base.isupper()
+        return base in _ENUMS  # only real Enum classes of the pinned sqlglot (not e.g. exp.UnixToTime.MICROS)
     return False
+
+
+_ENUMS = {"TokenType", "DType", "Type", "ScopeType", "ErrorLevel", "TrieResult", "Location", "PropertiesLocation",
+          "AliasPrecedence", "NormalizationStrategy", "IsPredicatePrecedence", "UsingColumnOrder", "Dialects"}
 
 
 def equiv_same(old_text, new_text):
@@ -682,6 +712,12 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
                 sel |= set(all_tests)
                 reasons.append(f"pytest-config {rel}")
             continue
+        if rel.endswith(".py") and TABLE_ON:
+            hit = table_lookup(old, f)
+            if hit is not None:
+                sel |= hit
+                reasons.append(f"table {old} -> {len(hit)}")
+                continue
         if rel.endswith(".py"):
             oi = mp.opens.get(old)
             if oi is not None and mp.set(oi):
@@ -905,7 +941,8 @@ def proxy_tpcds(plans, mp, num, ids, t_start, ms=None):
     e, o = num.get(EXEC_TPCDS), num.get(OPT_TPCDS)
     if not PROXY_ENABLED or e is None or o is None:
         return
-    todo = [p for p in plans if e in p[2] and proxy_eligible(mp, p[4], p[3], e, o)]
+    todo = [p for p in plans if e in p[2] and not any(r.startswith("table ") for r in p[3])
+            and proxy_eligible(mp, p[4], p[3], e, o)]
     if not todo:
         return
     try:
@@ -1017,7 +1054,11 @@ def main():
 
     plans = []
     cdir = os.path.join(DATA, "commits")
-    for name in sorted(n for n in os.listdir(cdir) if n.endswith(".patch")):
+    names = sorted(n for n in os.listdir(cdir) if n.endswith(".patch"))
+    if os.environ.get("BR_SHARD"):  # offline batch tooling only: "i/n"
+        si, sn = (int(x) for x in os.environ["BR_SHARD"].split("/"))
+        names = names[si::sn]
+    for name in names:
         with open(os.path.join(cdir, name), encoding="utf-8", errors="replace") as fh:
             text = fh.read()
         stem = name[:-6]

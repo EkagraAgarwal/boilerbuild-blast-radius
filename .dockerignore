@@ -5,3 +5,4 @@ __pycache__
 .git
 sample/
 index.marshal
+table.marshal

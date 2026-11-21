@@ -34,10 +34,11 @@ print('sqlglot', top, sorted(os.listdir('/sqlglot')))" \
  && chmod -R a+rX /sqlglot
 
 # Selector (+ runner.py when present) and the coverage map, world-readable.
-COPY *.py map.json.gz collect.json.gz querymap.json.gz /app/
+COPY *.py map.json.gz collect.json.gz querymap.json.gz table.json.gz /app/
 # Precompute statement indexes / string lines / identifier index of the pinned source and
 # convert the map to marshal, so the selector loads in milliseconds at run time.
 RUN rm -f /app/score.py && python /app/build_index.py /sqlglot /app/index.marshal /app/map.json.gz \
+ && python -c "import gzip, json, marshal; t = {k: (v[0], tuple(v[1])) for k, v in json.load(gzip.open('/app/table.json.gz', 'rt')).items()}; marshal.dump(t, open('/app/table.marshal', 'wb')); print('table', len(t))" \
  && python -m compileall -q /app && chmod -R a+rX /app
 
 CMD ["python", "/app/selector.py"]
