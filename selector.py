@@ -371,6 +371,7 @@ def stem_users(mp, rel):
 
 
 TESTS_BY_FILE = {}
+FUNC_WIDEN = os.environ.get("BR_FUNC_WIDEN", "1") == "1"
 ASSIGN_NAME = re.compile(r"^\s*([A-Za-z_]\w*)\s*(?::[^=]+)?=(?!=)")
 IMPORT_NAMES = re.compile(r"^\s*(?:from\s+\S+\s+)?import\s+(.+)$")
 
@@ -399,6 +400,9 @@ def line_candidates(mp, rel, src, stmts, ln):
                         if r.startswith(pkg):
                             wide |= mp.file_tests(r)
                 return wide, f"cached:{fname}"
+        if FUNC_WIDEN and enc and enc[0] == "def":
+            # a change can make unreached code in the same function reachable: everyone who ran it
+            return set(t) | mp.range_tests(rel, enc[1], enc[2]), None
         return t, None
     imp = mp.imp.get(rel, set())
     if not t and not any(i in imp for i in range(lo, hi + 1)):
@@ -502,6 +506,11 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
                 reasons.append(f"pytest-config {rel}")
             continue
         if rel.endswith(".py"):
+            oi = mp.opens.get(old)
+            if oi is not None and mp.set(oi):
+                # some tests read this source file as text (not just import it)
+                sel |= mp.set(oi)
+                reasons.append(f"read-as-data {old} -> {len(mp.set(oi))}")
             src = source_lines(old)
             if src is not None and f["new"] is not None:
                 new = apply_hunks(src, patch_text, f["new"])
@@ -520,6 +529,21 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
                 else:
                     reasons.append(f"apply-failed {old}")
             stmts = stmt_index(old, src)
+            # names newly defined or assigned by added lines (an override or a new class attribute
+            # changes behaviour wherever the base version / the name is used)
+            added_names = set()
+            for l in f["added"]:
+                m = re.match(r"\s*(?:async\s+)?def\s+(\w+)", l) or re.match(r"\s+([A-Z_][A-Z0-9_]+)\s*(?::[^=]+)?=(?!=)", l)
+                if m:
+                    added_names.add(m.group(1))
+            if added_names:
+                users = set()
+                for n in added_names:
+                    users |= name_users(mp, n)
+                fam = stem_users(mp, old)
+                hit = (users & fam) if (users and fam) else (users or fam or mp.file_tests(old))
+                sel |= hit
+                reasons.append(f"added[{','.join(sorted(added_names))[:60]}] {old} -> {len(hit)}")
             touched = set(f["changed"]) | set(f["ins"]) | {i + 1 for i in f["ins"]}
             for ln in sorted(touched):
                 t, why = line_candidates(mp, old, src, stmts, ln)
