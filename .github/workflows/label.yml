@@ -40,7 +40,8 @@ jobs:
           cp data/tests.json /work/tests.json
           cp data/mutants.json /work/allmut/
           python -c "import gzip,shutil; shutil.copyfileobj(gzip.open('data/sel.jsonl.gz'), open('/work/allmut/sel.jsonl','wb'))"
-          python -c "import json; [print(json.dumps({'id': l.strip(), 'status': 'seed'})) for l in open('data/done_ids.txt') if l.strip()]" > /work/allmut/labels.jsonl
+          SEED=data/done_ids.txt; if [ -f data/round.env ]; then . ./data/round.env; fi
+          python -c "import json,sys; [print(json.dumps({'id': l.strip(), 'status': 'seed'})) for l in open(sys.argv[1]) if l.strip()]" "$SEED" > /work/allmut/labels.jsonl
           nproc
       - name: label
         run: |

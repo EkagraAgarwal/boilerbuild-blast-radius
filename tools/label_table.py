@@ -27,6 +27,9 @@ def init_worker():
 
 
 def result(mid, cand_ms, status, failing, outside, secs, msg):
+    if ONLY:
+        return {"id": mid, "status": status, "only": sorted(ONLY), "failing": sorted(failing), "secs": round(secs, 3),
+                "msg": msg}
     return {"id": mid, "status": status, "failing": sorted(failing),
             "outside": sorted(outside), "cand_ms": cand_ms,
             "secs": round(secs, 3), "msg": msg}
@@ -77,6 +80,8 @@ def collapse_if_long(nodeids, cand):
 
 PROXY = os.environ.get("LT_PROXY", "/sub/tpcds_proxy.py")
 SLACK = float(os.environ.get("LT_SLACK", "1"))
+# LT_ONLY="1106": re-run just these tests (e.g. to check an inferred executor TPC-DS failure)
+ONLY = {int(x) for x in os.environ.get("LT_ONLY", "").split(",") if x.strip()}
 
 
 _QM = []
@@ -158,7 +163,7 @@ def run_one(task):
         # TPC-DS outside executor/generator code only fails together with it
         skip = set()
         proxy_fail = False
-        if OPT in cand:
+        if OPT in cand and not ONLY:
             skip.add(OPT)
             infer = EXEC in cand and not rel.startswith(UNSAFE)
             if infer:
@@ -268,6 +273,8 @@ def main():
         if mid in done_ids:
             continue
         cand = sel.get(mid, set())
+        if ONLY:
+            cand = cand & ONLY
         if not cand:
             continue
         cost_ms = sum(round(BY_NUM[n].get("seconds", 0.0) * 1000) for n in cand if n in BY_NUM)
