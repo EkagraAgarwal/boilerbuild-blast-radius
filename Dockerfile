@@ -35,6 +35,9 @@ print('sqlglot', top, sorted(os.listdir('/sqlglot')))" \
 
 # Selector (+ runner.py when present) and the coverage map, world-readable.
 COPY *.py map.json.gz /app/
-RUN rm -f /app/score.py && chmod -R a+rX /app
+# Precompute statement indexes / string lines / identifier index of the pinned source and
+# convert the map to marshal, so the selector loads in milliseconds at run time.
+RUN rm -f /app/score.py && python /app/build_index.py /sqlglot /app/index.marshal /app/map.json.gz \
+ && python -m compileall -q /app && chmod -R a+rX /app
 
 CMD ["python", "/app/selector.py"]

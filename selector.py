@@ -12,12 +12,11 @@ import os
 import re
 import sys
 import time
-from pathlib import Path
 
-DATA = Path(os.environ.get("BR_DATA", "/data"))
-HERE = Path(__file__).resolve().parent
-MAP = Path(os.environ.get("BR_MAP", HERE / "map.json.gz"))
-SRC = Path(os.environ.get("BR_SRC", "/sqlglot"))
+DATA = os.environ.get("BR_DATA", "/data")
+HERE = os.path.dirname(os.path.abspath(__file__))
+MAP = os.environ.get("BR_MAP", os.path.join(HERE, "map.json.gz"))
+SRC = os.environ.get("BR_SRC", "/sqlglot")
 WORKER_MS = 2000
 
 
@@ -25,11 +24,67 @@ def log(*a):
     print(*a, file=sys.stderr)
 
 
+def _stem(rel):
+    b = rel.rsplit("/", 1)[-1]
+    return b.rsplit(".", 1)[0] if "." in b else b
+
+
 # ---------------------------------------------------------------- map
+
+INDEX = os.environ.get("BR_INDEX", os.path.join(HERE, "index.marshal"))
+_IDX = None
+
+
+def load_index():
+    global _IDX
+    if _IDX is None:
+        _IDX = {}
+        if os.path.exists(INDEX):
+            import marshal
+            with open(INDEX, "rb") as f:
+                _IDX = marshal.load(f)
+    return _IDX
+
+
+_IDX_FILES = {}
+
+
+def index_file(rel):
+    if rel not in _IDX_FILES:
+        b = load_index().get("files", {}).get(rel)
+        if b is not None:
+            import marshal
+            b = marshal.loads(b)
+        _IDX_FILES[rel] = b
+    return _IDX_FILES[rel]
+
+
+_NAMES = None
+
+
+def files_with_name(name):
+    """Files whose text contains identifier `name` (None if no index)."""
+    global _NAMES
+    if _NAMES is None:
+        b = load_index().get("names")
+        if b is None:
+            _NAMES = False
+        else:
+            import marshal
+            _NAMES = marshal.loads(b)
+    if _NAMES is False:
+        return None
+    return _NAMES.get(name, ())
+
 
 class Map:
     def __init__(self, path):
-        m = json.loads(gzip.decompress(path.read_bytes()))
+        idx = load_index()
+        if idx.get("map"):
+            import marshal
+            m = marshal.loads(idx["map"])
+        else:
+            m = json.loads(gzip.decompress(open(path, "rb").read()))
         self.n = m["n"]
         self._sets_b64 = m["sets"]
         self._sets = {}
@@ -181,9 +236,13 @@ _src_cache = {}
 
 def source_lines(rel):
     if rel not in _src_cache:
-        p = SRC / rel
+        txt = load_index().get("texts", {}).get(rel)
+        if txt is not None:
+            _src_cache[rel] = txt.decode("utf-8").split("\n")
+            return _src_cache[rel]
         try:
-            _src_cache[rel] = p.read_text(encoding="utf-8").replace("\r\n", "\n").split("\n")
+            with open(os.path.join(SRC, rel), encoding="utf-8") as fh:
+                _src_cache[rel] = fh.read().replace("\r\n", "\n").split("\n")
         except OSError:
             _src_cache[rel] = None
     return _src_cache[rel]
@@ -272,6 +331,30 @@ def apply_hunks(old_lines, patch_text, rel):
     return out
 
 
+def fast_same(rel, f, src, new):
+    """Like ast_same but avoids parsing/dumping whole files when the edit is clearly
+    comment/blank-only, and only syntax-checks the new text when real code changed."""
+    pre = index_file(rel)
+    trivial = all(is_trivial(l) for l in f["removed"] + f["added"])
+    if trivial and pre is not None:
+        strl = set(pre["strlines"])
+        touch = set(f["changed"]) | set(f["ins"]) | {i + 1 for i in f["ins"]}
+        cont = any(1 <= i <= len(src) and src[i - 1].rstrip().endswith("\\") for i in f["ins"])
+        if not (touch & strl) and not cont:
+            return True
+    norm_old = [l.strip() for l in f["removed"] if not is_trivial(l)]
+    norm_new = [l.strip() for l in f["added"] if not is_trivial(l)]
+    if trivial or "".join(norm_old).replace(" ", "") == "".join(norm_new).replace(" ", ""):
+        return ast_same("\n".join(src), "\n".join(new))  # reformatting: compare properly
+    try:
+        compile("\n".join(new), rel, "exec", 0x400, dont_inherit=True)  # PyCF_ONLY_AST
+    except SyntaxError:
+        return "syntax"
+    except ValueError:
+        return False
+    return False
+
+
 def ast_same(old_text, new_text):
     """True/False if both parse and ASTs (without positions) are equal / differ.
     'syntax' if the new text doesn't parse."""
@@ -297,6 +380,10 @@ def stmt_index(rel, src):
     For compound statements (lo, hi) is the header only (incl. decorators); node_* is the whole node."""
     import ast
     if rel in _stmt_cache:
+        return _stmt_cache[rel]
+    pre = index_file(rel)
+    if pre is not None:
+        _stmt_cache[rel] = [tuple(x) for x in pre["stmts"]]
         return _stmt_cache[rel]
     out = []
     try:
@@ -336,19 +423,37 @@ def innermost(stmts, ln):
 
 
 _all_src = None
+_all_txt = {}
 
 
 def name_users(mp, name):
     """Tests that executed any sqlglot line mentioning identifier `name`."""
     global _all_src
+    fl = files_with_name(name)
+    if fl is not None:
+        pat = re.compile(r"\b" + re.escape(name) + r"\b")
+        out = set()
+        for rel in fl:
+            d = mp.lines.get(rel)
+            if not d:
+                continue
+            for i, l in enumerate(source_lines(rel) or [], 1):
+                if name in l and pat.search(l):
+                    k = d.get(str(i))
+                    if k is not None:
+                        out |= mp.set(k)
+        return out
     if _all_src is None:
         _all_src = {}
         for rel in mp.lines:
             if rel.endswith(".py"):
                 _all_src[rel] = source_lines(rel) or []
+                _all_txt[rel] = "\n".join(_all_src[rel])
     pat = re.compile(r"\b" + re.escape(name) + r"\b")
     out = set()
     for rel, lines in _all_src.items():
+        if name not in _all_txt[rel]:
+            continue
         d = mp.lines.get(rel) or {}
         for i, l in enumerate(lines, 1):
             if name in l and pat.search(l):
@@ -360,12 +465,12 @@ def name_users(mp, name):
 
 def stem_users(mp, rel):
     """Tests that executed code in any module sharing this file's stem (dialect families)."""
-    stem = Path(rel).stem
+    stem = _stem(rel)
     out = set()
     if stem in ("__init__", "dialect", "parser", "generator", "tokens", "tokenizer"):
         return None
     for r in mp.lines:
-        if r.startswith("sqlglot/") and Path(r).stem == stem:
+        if r.startswith("sqlglot/") and _stem(r) == stem:
             out |= mp.file_tests(r)
     return out
 
@@ -515,7 +620,7 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
             if src is not None and f["new"] is not None:
                 new = apply_hunks(src, patch_text, f["new"])
                 if new is not None:
-                    same = ast_same("\n".join(src), "\n".join(new))
+                    same = fast_same(old, f, src, new)
                     if same is True:
                         reasons.append(f"ast-same {old}")
                         continue
@@ -607,7 +712,8 @@ def run_estimate(sel, tests_meta):
 
 def main():
     t_start = time.monotonic()
-    tests = json.loads((DATA / "tests.json").read_text())["tests"]
+    with open(os.path.join(DATA, "tests.json"), encoding="utf-8") as fh:
+        tests = json.load(fh)["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     meta = {t["number"]: (t["file"], t["seconds"]) for t in tests}
     ids = {t["number"]: t["id"] for t in tests}
@@ -619,16 +725,19 @@ def main():
     TESTS_BY_FILE.update(tests_by_file)
 
     plans = []
-    for patch in sorted((DATA / "commits").glob("*.patch")):
-        text = patch.read_text(encoding="utf-8", errors="replace")
+    cdir = os.path.join(DATA, "commits")
+    for name in sorted(n for n in os.listdir(cdir) if n.endswith(".patch")):
+        with open(os.path.join(cdir, name), encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+        stem = name[:-6]
         files = parse_patch(text)
         try:
             sel, reasons = candidates(mp, files, tests_by_file, text, set(ms))
         except Exception as e:  # never crash: fall back to everything
-            log(f"{patch.stem}: selector error {e!r}; selecting all")
+            log(f"{stem}: selector error {e!r}; selecting all")
             sel, reasons = set(ms), ["error"]
         sel &= set(ms)
-        plans.append([patch.stem, text, sel, reasons])
+        plans.append([stem, text, sel, reasons])
 
     eligible = []
     if RUN_ENABLED:
