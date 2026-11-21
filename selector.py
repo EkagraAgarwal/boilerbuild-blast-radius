@@ -875,9 +875,21 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
                 hit = (users & fam) or (users | fam) or mp.file_tests(old)
                 # a new generator handler `foo_sql` changes output for expression class Foo everywhere
                 # this generator (or one inheriting from it) is used
+                # (a dialect's generator only generates for that dialect and the dialects built on it:
+                # tests naming one of them, iterating every dialect, or running its generator)
+                scope = None
+                if NARROW_SQL_OVERRIDE and old.startswith(("sqlglot/generators/", "sqlglot/dialects/")) \
+                        and not old.endswith(("/__init__.py", "/dialect.py")):
+                    dd = dialect_dependents(old)
+                    if dd:
+                        scope = dd | fam
+                if scope is not None and all(n.endswith("_sql") for n in added_names):
+                    # handler overrides only: tests in scope that ran the base handler or use the class
+                    hit = users & scope
                 for n in added_names:
                     if n.endswith("_sql"):
-                        hit |= expr_class_users(mp, n[:-4])
+                        ec = expr_class_users(mp, n[:-4])
+                        hit |= ec if scope is None else (ec & scope)
                 sel |= hit
                 reasons.append(f"added[{','.join(sorted(added_names))[:60]}] {old} -> {len(hit)}")
             touched = set(f["changed"]) | set(f["ins"]) | {i + 1 for i in f["ins"]}
@@ -1131,6 +1143,7 @@ def mentioning_tests(rel, tests_by_file):
 
 
 ALL_SLACK_MS = int(os.environ.get("BR_ALL_SLACK_MS", "500"))
+NARROW_SQL_OVERRIDE = os.environ.get("BR_NARROW_SQL", "1") == "1"
 
 # ---------------------------------------------------------------- partial executor replay
 # TestExecutor's TPC tests run ~100 fixture queries each. When the patch's changed lines are run by
