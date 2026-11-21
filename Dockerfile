@@ -34,9 +34,10 @@ print('sqlglot', top, sorted(os.listdir('/sqlglot')))" \
  && chmod -R a+rX /sqlglot
 
 # Build index + mutant table BEFORE copying selector code so code edits rebuild in ~1s.
-COPY build_index.py mk_table.py map.json.gz collect.json.gz querymap.json.gz table.json.gz /app/
+COPY build_index.py mk_table.py build_tpc_ops.py map.json.gz collect.json.gz querymap.json.gz table.json.gz /app/
 RUN python /app/build_index.py /sqlglot /app/index.marshal /app/map.json.gz \
- && python /app/mk_table.py /app/table.json.gz /app/table.marshal
+ && python /app/mk_table.py /app/table.json.gz /app/table.marshal \
+ && python /app/build_tpc_ops.py /sqlglot /app/tpc_ops.json
 COPY selector.py runner.py partial.py tpcds_proxy.py regdiff.py /app/
 RUN python -m compileall -q /app && chmod -R a+rX /app
 
