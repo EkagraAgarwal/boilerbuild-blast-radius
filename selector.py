@@ -858,7 +858,14 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
                     reasons.append(f"testfile {old} -> {len(own)}")
         else:
             i = mp.opens.get(old)
-            if i is not None:
+            tpc = TPC_CONSUMERS.get(old)
+            if tpc is not None and f["new"] == old and not any(l.lstrip().startswith("#") for l in f["added"]):
+                # TestExecutor.setUpClass loads the TPC query files for every test in the class, but only
+                # these tests use the queries (a new "#" line could make the loader raise: all openers)
+                hit = {TEST_NUM[t] for t in tpc if t in TEST_NUM}
+                sel |= hit
+                reasons.append(f"tpc-fixture {old} -> {len(hit)}")
+            elif i is not None:
                 sel |= mp.set(i)
                 reasons.append(f"opened {old} -> {len(mp.set(i))}")
             else:
@@ -871,6 +878,15 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
 _COLLECT = None
 TEST_NUM = {}
 MAP_REF = []
+TPC_CONSUMERS = {
+    "tests/fixtures/optimizer/tpc-h/tpc-h.sql": (
+        "tests/test_optimizer.py::TestOptimizer::test_tpch",
+        "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+        "tests/test_executor.py::TestExecutor::test_execute_tpch"),
+    "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": (
+        "tests/test_optimizer.py::TestOptimizer::test_tpcds",
+        "tests/test_executor.py::TestExecutor::test_execute_tpcds"),
+}
 _DIAL = []
 
 
