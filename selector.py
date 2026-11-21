@@ -655,6 +655,17 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
                 sel |= t
                 if why:
                     reasons.append(f"{why} {old}:{ln} -> {len(t)}")
+            # collection: an import, or function code that runs while pytest imports a test module
+            # (lazy exports, metaclasses), can make that module fail to import -> all its tests fail
+            cfiles = collection_files(old, stmts, touched)
+            if cfiles:
+                hit = {k for fl in cfiles for k in tests_by_file.get(fl, [])}
+                sel |= hit
+                reasons.append(f"collection {old} -> {len(cfiles)} files/{len(hit)}")
+            if not old.startswith(("sqlglot/", "tests/")):
+                hit = mentioning_tests(old, tests_by_file)
+                sel |= hit
+                reasons.append(f"repo-file {old} -> {len(hit)}")
             if old.startswith("tests/") and old in tests_by_file:
                 # a test-module edit outside any test body (imports, helpers at import, class attrs,
                 # setUpClass) can break every test in that file
@@ -669,8 +680,51 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
                 sel |= mp.set(i)
                 reasons.append(f"opened {old} -> {len(mp.set(i))}")
             else:
-                reasons.append(f"unmapped {old}")
+                hit = mentioning_tests(old, tests_by_file)
+                sel |= hit
+                reasons.append(f"unmapped {old} -> {len(hit)}")
     return sel, reasons
+
+
+_COLLECT = None
+
+
+def collection_files(rel, stmts, touched):
+    """Test files whose collection (module import) executes a risky touched statement."""
+    global _COLLECT
+    if _COLLECT is None:
+        p = os.path.join(HERE, "collect.json.gz")
+        _COLLECT = json.loads(gzip.decompress(open(p, "rb").read())) if os.path.exists(p) else {}
+    cl = (_COLLECT.get("lines") or {}).get(rel)
+    if not cl:
+        return set()
+    out = set()
+    for ln in touched:
+        s = innermost(stmts, ln)
+        if s is None:
+            continue
+        lo, hi, kind, nlo, nhi, in_func = s
+        if not (in_func or kind in ("Import", "ImportFrom")):
+            continue
+        for l in range(lo, hi + 1):
+            g = cl.get(str(l))
+            if g is not None:
+                out.update(_COLLECT["files"][i] for i in _COLLECT["groups"][g])
+    return out
+
+
+def mentioning_tests(rel, tests_by_file):
+    """Repo files the coverage map doesn't trace (e.g. sqlglotc/setup.py, data files): tests in
+    test modules whose source mentions the file's path or its top folder + file name."""
+    parts = rel.split("/")
+    base = parts[-1]
+    top = parts[0] if len(parts) > 1 else None
+    out = set()
+    for fl, ks in tests_by_file.items():
+        txt = "\n".join(source_lines(fl) or [])
+        if rel in txt or (top and top in txt and base in txt) or (not top and base in txt):
+            out |= set(ks)
+    return out
 
 
 def pack(tests, ms):
