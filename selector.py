@@ -553,6 +553,80 @@ def stmt_index(rel, src):
     return out
 
 
+def _eager_call(text):
+    """A call that executes when this statement runs (calls inside lambdas/defs run later)."""
+    if "(" not in text:
+        return False
+    import ast
+    import textwrap
+    body = textwrap.dedent(text).strip().rstrip(",")
+    tree = None
+    # fragments: a dict entry, an argument list item, a block header without its body
+    for cand in (body, "{%s}" % body, "(%s)" % body, "[%s]" % body, body + "\n    pass", "f(%s)" % body):
+        try:
+            tree = ast.parse(cand)
+            break
+        except SyntaxError:
+            continue
+    if tree is None:
+        return True  # can't tell: be safe
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if isinstance(node, ast.Call):
+            return True
+        stack.extend(ast.iter_child_nodes(node))
+    return False
+
+
+def _may_raise_at_import(f, stmts, src):
+    """Does the edit touch import-time code that could raise: a call outside any function body, a
+    def/class header (renamed binding), or a deleted top-level/class-level statement?"""
+    added_code = [l for l in f["added"] if not is_trivial(l)]
+    removed_code = [l for l in f["removed"] if not is_trivial(l)]
+    # import-time calls the edit adds, removes or alters (a renamed dict key next to an unchanged
+    # call is not a new way to fail)
+    calls_changed = _call_snippets(removed_code) != _call_snippets(added_code)
+    for ln in set(f["changed"]) | set(f["ins"]):
+        if not 1 <= ln <= len(src):
+            continue
+        s = innermost(stmts, ln)
+        if s is None:
+            continue
+        lo, hi, kind, nlo, nhi, in_func = s
+        if kind in ("FunctionDef", "AsyncFunctionDef", "ClassDef"):
+            if nlo <= ln <= nhi and ln in f["changed"]:
+                return True  # header (name, decorators, bases, defaults) of a def/class
+            continue
+        if in_func:
+            continue
+        if calls_changed and (any(_eager_call(l) for l in added_code + removed_code)
+                              or _eager_call("\n".join(src[lo - 1:hi]))):
+            return True  # a call that runs at import time was added, removed or changed
+    return False
+
+
+def _call_snippets(lines):
+    """Multiset-ish view of the calls written on these lines: 'name(args...)' substrings."""
+    out = []
+    for l in lines:
+        code = _code_part(l)
+        for m in re.finditer(r"[A-Za-z_][\w.]*\s*\(", code):
+            depth, j = 0, m.end() - 1
+            while j < len(code):
+                if code[j] == "(":
+                    depth += 1
+                elif code[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            out.append(code[m.start():j + 1])
+    return sorted(out)
+
+
 def innermost(stmts, ln):
     best = None
     for s in stmts:
@@ -814,7 +888,19 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests):
                         continue
                 else:
                     reasons.append(f"apply-failed {old}")
+            if IMPORT_FAIL and old.startswith("sqlglot/") and any(
+                    re.match(r"(from|import)\s", l) for l in f["added"] + f["removed"]):
+                # an added/removed top-level import can make the whole module fail to import
+                hit = import_failure_tests(mp, old)
+                sel |= all_tests if hit is None else hit
+                reasons.append(f"toplevel-import {old} -> {'all' if hit is None else len(hit)}")
             stmts = stmt_index(old, src)
+            if IMPORT_FAIL and old.startswith("sqlglot/") and src and _may_raise_at_import(f, stmts, src):
+                # an edit to code that runs while the module imports (a call in a class body, a
+                # renamed/deleted top-level def) can make the import raise: every user breaks
+                hit = import_failure_tests(mp, old)
+                sel |= all_tests if hit is None else hit
+                reasons.append(f"import-risk {old} -> {'all' if hit is None else len(hit)}")
             # names newly defined or assigned by added lines (an override or a new class attribute
             # changes behaviour wherever the base version / the name is used)
             added_names = set()
