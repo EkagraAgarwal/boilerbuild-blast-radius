@@ -72,8 +72,33 @@ def dialect_index(src):
                    if p.stem not in ("__init__", "dialect"))
     nameset = set(names)
 
+    import re as _re
+    word = _re.compile(r"[a-z0-9_]+")
+    # dialect class names (Athena, TSQL, ...) -> module stem
+    classmap = {}
+    for p in (src / "sqlglot" / "dialects").glob("*.py"):
+        if p.stem not in nameset:
+            continue
+        try:
+            for node in ast.parse(p.read_text(encoding="utf-8")).body:
+                if isinstance(node, ast.ClassDef):
+                    classmap[node.name] = p.stem
+        except SyntaxError:
+            pass
+
     def strings(node):
-        return {n.value for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+        """Dialect names a node refers to: words inside string literals, or dialect class names."""
+        out = set()
+        for n in ast.walk(node):
+            if isinstance(n, ast.Constant) and isinstance(n.value, str):
+                out |= set(word.findall(n.value.lower())) & nameset
+            elif isinstance(n, ast.Name) and n.id in classmap:
+                out.add(classmap[n.id])
+            elif isinstance(n, ast.Attribute) and n.attr in classmap:
+                out.add(classmap[n.attr])
+            elif isinstance(n, ast.alias) and n.name.split(".")[-1] in classmap:
+                out.add(classmap[n.name.split(".")[-1]])
+        return out
 
     users = {}
     for p in sorted((src / "tests").rglob("test_*.py")):
@@ -87,18 +112,18 @@ def dialect_index(src):
                 cls = set()
                 for b in node.body:
                     if isinstance(b, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "dialect" for t in b.targets):
-                        cls |= strings(b) & nameset
+                        cls |= strings(b)
                 for b in node.body:
                     if isinstance(b, (ast.FunctionDef, ast.AsyncFunctionDef)) and b.name.startswith("test"):
                         tid = f"{rel}::{node.name}::{b.name}"
-                        for d in (strings(b) & nameset) | cls:
+                        for d in strings(b) | cls:
                             users.setdefault(d, []).append(tid)
                         # iterating the Dialects enum / Dialect.classes loads every dialect
                         if any(isinstance(n, ast.Name) and n.id == "Dialects" or
                                isinstance(n, ast.Attribute) and n.attr == "classes" for n in ast.walk(b)):
                             users.setdefault("*", []).append(tid)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
-                for d in strings(node) & nameset:
+                for d in strings(node):
                     users.setdefault(d, []).append(f"{rel}::{node.name}")
 
     # top-level imports between dialect-family modules
@@ -149,7 +174,19 @@ def dialect_index(src):
         found = sorted(set(word.findall(text)) & nameset)
         if found:
             fix[p.relative_to(src).as_posix()] = found
-    return {"users": users, "deps": {k: sorted(v) for k, v in needed_by.items()}, "fixtures": fix}
+    srclines = {}
+    for p in sorted((src / "sqlglot").rglob("*.py")):
+        rel = p.relative_to(src).as_posix()
+        try:
+            toks = list(tokenize.generate_tokens(io.StringIO(p.read_text(encoding="utf-8")).readline))
+        except (tokenize.TokenError, SyntaxError, IndentationError):
+            continue
+        for t in toks:
+            if t.type == tokenize.STRING:
+                for d in set(word.findall(t.string.lower())) & nameset:
+                    srclines.setdefault(d, []).append([rel, t.start[0]])
+    return {"users": users, "deps": {k: sorted(v) for k, v in needed_by.items()}, "fixtures": fix,
+            "srclines": srclines}
 
 
 def import_index(src):

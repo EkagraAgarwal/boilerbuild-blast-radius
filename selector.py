@@ -950,6 +950,10 @@ def dialect_dependents(rel):
             if oi is not None:
                 out |= MAP_REF[0].set(oi)
     for name in names:
+        # sqlglot code that loads the dialect by name at run time (e.g. a "teradata" format table)
+        for f, ln in d.get("srclines", {}).get(name, ()):
+            if MAP_REF:
+                out |= set(MAP_REF[0].line_tests(f, ln) or ())
         for tid in d["users"].get(name, ()):
             k = TEST_NUM.get(tid)
             if k is not None:
