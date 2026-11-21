@@ -78,6 +78,37 @@ def collapse_if_long(nodeids, cand):
 PROXY = os.environ.get("LT_PROXY", "/sub/tpcds_proxy.py")
 
 
+_QM = []
+
+
+def proxy_subset(rel, lineno, lines):
+    """TPC-DS queries whose coverage touches the function enclosing the mutated line ("" = all 99).
+    Same query map the selector's proxy uses; a line outside any function replays everything."""
+    try:
+        import ast
+        sys.path.insert(0, os.path.dirname(PROXY))
+        import partial
+        if not _QM:
+            import gzip
+            _QM.append(json.loads(gzip.decompress(open(os.path.join(os.path.dirname(PROXY), "querymap.json.gz"),
+                                                         "rb").read())))
+        tree = ast.parse(chr(10).join(lines))
+        best = None
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.lineno <= lineno <= node.end_lineno:
+                if best is None or node.lineno > best.lineno:
+                    best = node
+        if best is None:
+            return ""
+        lo = min([best.lineno] + [d.lineno for d in best.decorator_list])
+        q, setup = partial.queries_touching(_QM[0], "tpcds", {rel: set(range(lo, best.end_lineno + 1))})
+        if setup or not q:
+            return ""
+        return ",".join(map(str, q))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def collect_of(out):
     return read_label(out)[1]
 
@@ -131,7 +162,8 @@ def run_one(task):
             infer = EXEC in cand and not rel.startswith(UNSAFE)
             if infer:
                 skip.add(EXEC)
-            rc_p, st_p = run_group([sys.executable, PROXY, WORK_DIR], env, 300)
+            subset = proxy_subset(rel, lineno, lines)
+            rc_p, st_p = run_group([sys.executable, PROXY, WORK_DIR] + ([subset] if subset else []), env, 300)
             if st_p != "ok":
                 return result(mid, cand_ms, "timeout", [], [], time.time() - t0, "proxy timeout")
             proxy_fail = rc_p != 0
@@ -192,6 +224,7 @@ def main():
     ap.add_argument("--jobs", type=int, default=6)
     ap.add_argument("--order", choices=["cost", "id", "ratio"], default="ratio")
     ap.add_argument("--max-label-ms", type=int, default=0)
+    ap.add_argument("--first", default="", help="file of mutant ids to label before everything else")
     ap.add_argument("--deadline-s", type=int, default=0, help="stop taking new mutants after this many seconds")
     ap.add_argument("--min-cost-ms", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0)
@@ -248,7 +281,11 @@ def main():
             key = -(packed.get(mid, 0) - 2500) / lab if a.order == "ratio" else -cost_ms
             tasks.append((mid, key, (mid, rel, lineno, old, new, op, nodeids, cand, cost_ms)))
 
-    tasks.sort(key=(lambda x: x[1]) if a.order in ("cost", "ratio") else (lambda x: x[0]))
+    first = set()
+    if a.first and os.path.exists(a.first):
+        first = {l.strip() for l in open(a.first) if l.strip()}
+    tasks.sort(key=(lambda x: (x[0] not in first, x[1])) if a.order in ("cost", "ratio")
+               else (lambda x: (x[0] not in first, x[0])))
     try:
         si, sn = (int(x) for x in a.shard.split("/"))
     except ValueError:

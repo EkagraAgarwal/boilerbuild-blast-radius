@@ -8,7 +8,7 @@ on:
 jobs:
   label:
     runs-on: ubuntu-latest
-    timeout-minutes: 130
+    timeout-minutes: 75
     container:
       image: python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
     strategy:
@@ -20,6 +20,7 @@ jobs:
       SKIP_INTEGRATION: "0"
       PYTHONDONTWRITEBYTECODE: "1"
       LT_PROXY: /tools/tpcds_proxy.py
+      DEADLINE: "2700"
     steps:
       - uses: actions/checkout@v4
       - name: deps
@@ -35,7 +36,7 @@ jobs:
           shutil.move("/tmp/sg/" + top, "/src")
           EOF
           mkdir -p /tools /work/allmut
-          cp tools/*.py /tools/
+          cp tools/*.py tools/querymap.json.gz /tools/
           cp data/tests.json /work/tests.json
           cp data/mutants.json /work/allmut/
           python -c "import gzip,shutil; shutil.copyfileobj(gzip.open('data/sel.jsonl.gz'), open('/work/allmut/sel.jsonl','wb'))"
@@ -44,7 +45,7 @@ jobs:
       - name: label
         run: |
           python /tools/label_table.py --out /work/allmut/labels.jsonl --jobs 4 --order ratio \
-            --shard ${{ matrix.shard }}/20 --deadline-s ${DEADLINE:-6000} --max-label-ms 300000 || true
+            --first data/priority_ids.txt --shard ${{ matrix.shard }}/20 --deadline-s ${DEADLINE:-6000} --max-label-ms 300000 || true
           grep -v '"status": "seed"' /work/allmut/labels.jsonl > labels-${{ matrix.shard }}.jsonl || true
           wc -l labels-${{ matrix.shard }}.jsonl
       - uses: actions/upload-artifact@v4
