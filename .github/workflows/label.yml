@@ -40,7 +40,7 @@ jobs:
           cp data/mutants.json /work/allmut/
           python -c "import gzip,shutil; shutil.copyfileobj(gzip.open('data/sel.jsonl.gz'), open('/work/allmut/sel.jsonl','wb'))"
           python -c "import json; [print(json.dumps({'id': l.strip(), 'status': 'seed'})) for l in open('data/done_ids.txt') if l.strip()]" > /work/allmut/labels.jsonl
-          nproc; free -g
+          nproc
       - name: label
         run: |
           python /tools/label_table.py --out /work/allmut/labels.jsonl --jobs 4 --order ratio \
