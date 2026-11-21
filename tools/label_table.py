@@ -80,6 +80,7 @@ def collapse_if_long(nodeids, cand):
 
 PROXY = os.environ.get("LT_PROXY", "/sub/tpcds_proxy.py")
 SLACK = float(os.environ.get("LT_SLACK", "1"))
+XDIST = int(os.environ.get("LT_XDIST", "0"))  # pytest-xdist workers per labeling run (huge candidate sets)
 # LT_ONLY="1106": re-run just these tests (e.g. to check an inferred executor TPC-DS failure)
 ONLY = {int(x) for x in os.environ.get("LT_ONLY", "").split(",") if x.strip()}
 
@@ -189,7 +190,7 @@ def run_one(task):
         if run:
             ids = [BY_NUM[n]["id"] for n in sorted(run)]
             cmd = [sys.executable, "-m", "pytest", "-p", "brlabel", "-p", "no:cacheprovider",
-                   "-o", "addopts=", "--timeout", "300", "-q"] + collapse_if_long(ids, run)
+                   "-o", "addopts=", "--timeout", "300", "-q"] + (["-n", str(XDIST)] if XDIST else [])                 + collapse_if_long(ids, run)
             rc, status = run_group(cmd, env, limit)
             if status == "ok":
                 if not os.path.exists(out) or rc not in (0, 1, 2, 4) or (rc in (2, 4) and not collect_of(out)):
