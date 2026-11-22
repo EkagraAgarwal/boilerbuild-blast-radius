@@ -2419,8 +2419,6 @@ def fast_run_candidates(plans, meta, num, ids, ms, t_start):
         if not p[2] or any(r.startswith(("table ", "SYNTAX", "apply-failed", "error", "import-fail"))
                            for r in p[3]):
             continue
-        if len(p[2]) == 1 and any(r.startswith("opened tests/fixtures/") for r in p[3]):
-            continue  # single fixture opener: one test, no useful ROI
         if any((meta.get(k) or ("", 0))[0] in EXPENSIVE_FILES for k in p[2]):
             continue
         if any(r.startswith("header:") for r in p[3]):
@@ -2435,9 +2433,18 @@ def fast_run_candidates(plans, meta, num, ids, ms, t_start):
             r.startswith(("importtime[", "regdiff-", "collection-ok"))
             for r in p[3]
         )
+        # Diagnostic ROI gate (slot4-safe):
+        # - Keep useful 1→0 clears: allow len==1 ONLY when has_high_roi (added/regdiff/importtime/
+        #   collection-ok), which is where 8b35b86 logs showed 1→0 paying off.
+        # - Block likely 1→1 CPU waste: skip len<=1 without high_roi (and fixture openers).
+        # - Never run when expected save is tiny or packed cost is below ~2.3s.
+        if len(p[2]) <= 1 and not has_high_roi:
+            continue
+        if len(p[2]) == 1 and any(r.startswith("opened tests/fixtures/") for r in p[3]):
+            continue
         if not (has_high_roi or packed_s >= 4.0):
             continue
-        if not (is_added or any(r.startswith("regdiff-") for r in p[3])) and packed_s < 2.35:
+        if packed_s < 2.3:
             continue
         if est <= FAST_RUN_MAX_S and est < packed_s * 0.65 and packed_s - est >= 1.0:
             eligible.append((-(packed_s - est), p))
