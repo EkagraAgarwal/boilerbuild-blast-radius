@@ -13,6 +13,7 @@ board's simulated seconds / miss count reveal where our practice cost goes:
 Cost classes from our own packed cost c (ms): 0: c==0, 1: c<=3000, 2: 3000<c<10000, 3: c>=10000.
 """
 import json
+import re
 import os
 import subprocess
 import sys
@@ -54,7 +55,14 @@ def pick(ms, target, avoid):
 
 def main():
     p = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "selector.py")],
-                       stdout=subprocess.PIPE)
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    err = p.stderr.decode(errors="replace")
+    sys.stderr.write(err)
+    why = {}
+    for l in err.splitlines():
+        m = re.match(r"^(\S+): \d+ tests, ", l)
+        if m:
+            why[m.group(1)] = l
     tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     lines = [json.loads(l) for l in p.stdout.decode().splitlines() if l.strip()]
@@ -71,6 +79,21 @@ def main():
                 markers[k] = pick(ms, D[k], set())
             m = markers[k]
             out.append({"commit": o["commit"], "workers": [m] if m is not None else []})
+        elif MODE == "census2":
+            r = why.get(o["commit"], "")
+            tab = "table sqlglot/" in r or "table tests/" in r
+            d = 0 if k == 0 else (1 if tab else (41 if k >= 2 else 1681))
+            if d not in markers:
+                markers[d] = pick(ms, d, set())
+            out.append({"commit": o["commit"], "workers": [markers[d]]})
+        elif MODE == "keeptable":
+            r = why.get(o["commit"], "")
+            tab = "table sqlglot/" in r or "table tests/" in r
+            out.append({"commit": o["commit"], "workers": ws if tab else []})
+        elif MODE.startswith("keep3drop:"):
+            drop = {int(x) for x in MODE[10:].split(",")}
+            ws2 = [[n for n in w if n not in drop] for w in ws] if k == 3 else []
+            out.append({"commit": o["commit"], "workers": [w for w in ws2 if w]})
         elif MODE.startswith("keep:"):
             keep = {int(ch) for ch in MODE[5:]}
             out.append({"commit": o["commit"], "workers": ws if k in keep else []})
