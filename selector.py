@@ -362,9 +362,101 @@ def _code_part(line):
     return line.strip()
 
 
+def _is_pure_assign_swap(old_src, new_src):
+    """True iff the two sources differ only by swapping two adjacent, independent,
+    pure single-name assignments inside a statement list (no try/finally bodies)."""
+    import ast
+
+    try:
+        t1 = ast.parse(old_src)
+        t2 = ast.parse(new_src)
+    except (SyntaxError, ValueError):
+        return False
+
+    pure_nodes = (ast.Constant, ast.Name, ast.Attribute, ast.Subscript, ast.Slice, ast.Tuple,
+                  ast.List, ast.Set, ast.Dict, ast.UnaryOp, ast.BinOp, ast.BoolOp, ast.Compare,
+                  ast.IfExp, ast.Load, ast.operator, ast.unaryop, ast.boolop, ast.cmpop, ast.Call)
+    pure_calls = {"len", "seq_get", "isinstance", "type", "bool", "int", "str", "float", "tuple",
+                  "list", "set", "dict", "frozenset", "min", "max", "abs", "ord", "chr"}
+    try_types = (ast.Try, getattr(ast, "TryStar", ast.Try))
+
+    def pure(node):
+        for n in ast.walk(node):
+            if not isinstance(n, pure_nodes):
+                return False
+            if isinstance(n, ast.Call) and not (
+                    isinstance(n.func, ast.Name) and n.func.id in pure_calls):
+                return False
+        return True
+
+    def assign_info(node):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name):
+            return node.targets[0].id, node.value
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
+                and node.value is not None:
+            return node.target.id, node.value
+        return None
+
+    def loads(node):
+        return {n.id for n in ast.walk(node)
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+
+    def cmp_lists(a, b):
+        if len(a) != len(b):
+            return False
+        # No difference at this level (a nested swap may still make the children differ).
+        if all(same(x, y) for x, y in zip(a, b)):
+            return True
+        for i in range(len(a) - 1):
+            if not (same(a[i], b[i + 1]) and same(a[i + 1], b[i])):
+                continue
+            if any(not same(a[j], b[j]) for j in list(range(i)) + list(range(i + 2, len(a)))):
+                continue
+            ia, ib = assign_info(a[i]), assign_info(a[i + 1])
+            if ia is None or ib is None:
+                continue
+            x, rhs1 = ia
+            y, rhs2 = ib
+            if x == y or y in loads(rhs1) or x in loads(rhs2):
+                continue
+            if pure(rhs1) and pure(rhs2):
+                return True
+        return False
+
+    def same(a, b):
+        if isinstance(a, list) or isinstance(b, list):
+            return (isinstance(a, list) and isinstance(b, list) and len(a) == len(b)
+                    and all(same(x, y) for x, y in zip(a, b)))
+        if isinstance(a, ast.AST) or isinstance(b, ast.AST):
+            if not (isinstance(a, ast.AST) and isinstance(b, ast.AST)) or type(a) is not type(b):
+                return False
+            for fld in a._fields:
+                va, vb = getattr(a, fld), getattr(b, fld)
+                if fld in ("body", "orelse", "finalbody") and not isinstance(a, try_types) \
+                        and isinstance(va, list) and isinstance(vb, list) and va and vb \
+                        and all(isinstance(x, ast.stmt) for x in va + vb):
+                    if not cmp_lists(va, vb):
+                        return False
+                    continue
+                if not same(va, vb):
+                    return False
+            return True
+        return a == b
+
+    return same(t1, t2)
+
+
 def fast_same(rel, f, src, new):
     """Like ast_same but avoids parsing/dumping whole files when the edit is clearly
     comment/blank-only, and only syntax-checks the new text when real code changed."""
+    # A pure adjacent swap of two independent assignments moves identical lines around, which the
+    # reformatting short-circuit below would otherwise compare as "different".
+    if EQUIV and new is not None and src is not None and len(f["removed"]) >= 1 \
+            and len(f["added"]) >= 1 \
+            and {l.strip() for l in f["added"]} == {l.strip() for l in f["removed"]} \
+            and _is_pure_assign_swap("\n".join(src), "\n".join(new)):
+        return True
     pre = index_file(rel)
     trivial = all(is_trivial(l) for l in f["removed"] + f["added"])
     if trivial and pre is not None:
@@ -405,6 +497,72 @@ def _in_strings(pre, f):
     strl = set(pre["strlines"])
     touched = set(f["changed"]) | set(f["ins"])
     return bool(touched) and touched <= strl
+
+
+def _is_type_checking_only_edit(src, new, f):
+    """True when every touched line is the header of a top-level `if TYPE_CHECKING:`
+    whose import-only body is unchanged (only the condition was edited)."""
+    import ast
+
+    def bound(if_node):
+        out = set()
+        for s in if_node.body:
+            if isinstance(s, ast.Import):
+                for a in s.names:
+                    out.add(a.asname or a.name.split(".")[0])
+            elif isinstance(s, ast.ImportFrom):
+                for a in s.names:
+                    out.add(a.asname or a.name)
+        return out
+
+    def mentions_type_checking(node):
+        return any((isinstance(x, ast.Name) and x.id == "TYPE_CHECKING")
+                   or (isinstance(x, ast.Attribute) and x.attr == "TYPE_CHECKING")
+                   for x in ast.walk(node))
+
+    try:
+        old_tree = ast.parse("\n".join(src))
+        new_tree = ast.parse("\n".join(new))
+    except (SyntaxError, ValueError):
+        return False
+    touched = set(f["changed"]) | set(f["ins"])
+    if not touched:
+        return False
+    old_ifs = [n for n in old_tree.body if isinstance(n, ast.If)]
+    new_ifs = [n for n in new_tree.body if isinstance(n, ast.If)]
+    if len(old_ifs) != len(new_ifs):
+        return False
+    def other_names(skip):
+        """Top-level bindings other than `skip` (the guard being edited)."""
+        out = set()
+        for n in old_tree.body:
+            if n is skip:
+                continue
+            if isinstance(n, (ast.Assign, ast.AnnAssign)):
+                tgts = n.targets if isinstance(n, ast.Assign) else [n.target]
+                for t in tgts:
+                    if isinstance(t, ast.Name):
+                        out.add(t.id)
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                out.add(n.name)
+            elif isinstance(n, (ast.Import, ast.ImportFrom, ast.If)):
+                stmts = n.body if isinstance(n, ast.If) else [n]
+                for s in stmts:
+                    if isinstance(s, (ast.Import, ast.ImportFrom)):
+                        for a in s.names:
+                            out.add(a.asname or a.name.split(".")[0])
+        return out
+
+    covered = set()
+    for old_if, new_if in zip(old_ifs, new_ifs):
+        if not (old_if.body and not old_if.orelse and not new_if.orelse
+                and mentions_type_checking(old_if.test)
+                and all(isinstance(s, (ast.Import, ast.ImportFrom)) for s in old_if.body)
+                and [ast.dump(s) for s in old_if.body] == [ast.dump(s) for s in new_if.body]
+                and not (bound(old_if) & other_names(old_if))):
+            continue
+        covered.update(range(old_if.lineno, max(old_if.lineno, old_if.body[0].lineno - 1) + 1))
+    return touched <= covered
 
 
 EQUIV = os.environ.get("BR_EQUIV", "1") == "1"
@@ -725,6 +883,41 @@ def _load_tpc_ops():
     return _TPC_OPS
 
 
+_EXPR_MAP = None
+
+
+def _load_expr_map():
+    """Lazily load exprmap.json.gz (exact per-test Expression instantiations + import-time exprs)."""
+    global _EXPR_MAP
+    if not TEST_NUM:
+        return {"exprs": {}, "import_dialects": {}, "import_core": frozenset()}
+    if _EXPR_MAP is None:
+        out = {"exprs": {}, "import_dialects": {}, "import_core": frozenset()}
+        try:
+            with gzip.open(os.path.join(HERE, "exprmap.json.gz"), "rt", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            tids = raw.get("tests") or []
+            remap = {i: TEST_NUM[tid] for i, tid in enumerate(tids) if tid in TEST_NUM}
+            exprs = {}
+            for cls_name, idxs in (raw.get("exprs") or {}).items():
+                nums = frozenset(remap[i] for i in idxs if i in remap)
+                if nums:
+                    exprs[cls_name] = nums
+            imp_dial = {}
+            for dname, clist in (raw.get("import_dialects") or {}).items():
+                for c in clist:
+                    imp_dial.setdefault(c, set()).add(dname)
+            out = {
+                "exprs": exprs,
+                "import_dialects": {c: frozenset(ds) for c, ds in imp_dial.items()},
+                "import_core": frozenset(raw.get("import_core") or ()),
+            }
+        except Exception:  # noqa: BLE001
+            pass
+        _EXPR_MAP = out
+    return _EXPR_MAP
+
+
 _FIX_CACHE = {}
 
 
@@ -931,6 +1124,64 @@ def line_candidates(mp, rel, src, stmts, ln, widen_fn=False, bonus=None):
     return mp.file_tests(rel) | t, "importtime[file]"
 
 
+_FIXTURE_META_KEYS = frozenset({
+    "title", "dialect", "schema", "leave_tables_isolated",
+    "validate_qualify_columns", "canonicalize_table_aliases",
+    "execute", "execute_min_python",
+})
+
+
+def _sql_fixture_equiv(old, f, patch_text):
+    """True iff every sqlglot test reading this .sql fixture receives identical parsed data.
+
+    All tests/fixtures/**/*.sql files are read via tests/helpers.py's load_sql_fixtures or
+    load_sql_fixture_pairs, both of which discard blank and '--' lines via _filter_comments.
+    For load_sql_fixture_pairs files, '# key: val' metadata lines whose key is not read by
+    any test are also unobservable provided the loader parses them without error.
+    """
+    if not (old.startswith("tests/fixtures/") and old.endswith(".sql") and f["new"] == old):
+        return False
+    if not all((not l) or l.startswith("--") or l.startswith("#") for l in f["removed"] + f["added"]):
+        return False
+    src = source_lines(old)
+    new = apply_hunks(src, patch_text, old) if src is not None else None
+    if new is None:
+        return False
+    old_f = "\n".join(line for line in src if line and not line.startswith("--"))
+    new_f = "\n".join(line for line in new if line and not line.startswith("--"))
+    if old_f == new_f:
+        return True
+    if not ((old.startswith("tests/fixtures/optimizer/")
+             and old != "tests/fixtures/optimizer/qualify_columns__invalid.sql")
+            or old == "tests/fixtures/pretty.sql"):
+        return False
+
+    def _parse_pairs(filtered):
+        stmts = filtered.split(";")
+        out = []
+        for idx in range(0, len(stmts), 2):
+            if idx + 1 < len(stmts):
+                sql_lines = stmts[idx].strip().split("\n")
+                j = 0
+                meta = {}
+                while j < len(sql_lines) and sql_lines[j].startswith("#"):
+                    if ":" not in sql_lines[j]:
+                        return None
+                    k, v = sql_lines[j].split(":", 1)
+                    k = k.lstrip("#").strip()
+                    if k in _FIXTURE_META_KEYS:
+                        meta[k] = v.strip()
+                    j += 1
+                if j >= len(sql_lines):
+                    return None
+                out.append((tuple(sorted(meta.items())), "\n".join(sql_lines[j:]), stmts[idx + 1].strip()))
+        return out
+
+    op = _parse_pairs(old_f)
+    np = _parse_pairs(new_f)
+    return op is not None and np is not None and op == np
+
+
 def _tpc_fixture_parses_cleanly(old, f, patch_text):
     """Would load_sql_fixture_pairs still parse this TPC fixture after the patch?
 
@@ -1066,6 +1317,18 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests, bonus=None):
                             sel |= hit
                             reasons.append(f"import-fail {old} -> {len(hit)}")
                     continue
+            if old.startswith("sqlglot/") and new is not None and same not in (True, "syntax") \
+                    and _is_type_checking_only_edit(src, new, f):
+                # Changing the condition of an import-only `if TYPE_CHECKING:` block cannot change
+                # runtime behaviour: at run time neither branch executes.  The only remaining risk
+                # is that the patched module (or an importer of it) fails to import.
+                if old not in IMPORT_OK:
+                    hit = import_failure_tests(mp, old) if IMPORT_FAIL else None
+                    sel |= all_tests if hit is None else hit
+                    reasons.append(f"import-risk {old} -> {'all' if hit is None else len(hit)}")
+                else:
+                    reasons.append(f"typecheck-ok {old}")
+                continue
             if IMPORT_FAIL and old.startswith("sqlglot/") and any(
                     re.match(r"(from|import)\s", l) for l in f["added"] + f["removed"]) and not (
                     old in IMPORT_OK and not _removed_import_names_used(f, src, patch_text)):
@@ -1219,70 +1482,96 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests, bonus=None):
                                 for tid in (EXEC_TPCDS, EXEC_TPCH, OPT_TPCH_EXEC):
                                     if tid in TEST_NUM:
                                         tpc_skip.add(TEST_NUM[tid])
+                                exec_scope = set(tests_by_file.get("tests/test_executor.py", [])) | mp.file_tests(old)
                                 hit = set(tests_by_file.get("tests/test_executor.py", [])) - tpc_skip
                                 for k in changed_keys:
-                                    hit |= name_users(mp, k)
-                                    hit |= expr_class_users(mp, k.lower())
-                                hit |= mp.file_tests(old) - tpc_skip
-                                ds_num, ch_num = TEST_NUM.get(EXEC_TPCDS), TEST_NUM.get(EXEC_TPCH)
-                                hit.discard(ds_num)
-                                hit.discard(ch_num)
-                                if _env_hit("tpcds") and ds_num is not None:
-                                    hit.add(ds_num)
-                                if _env_hit("tpch") and ch_num is not None:
-                                    hit.add(ch_num)
-                                sel |= hit
-                                reasons.append(f"regdiff-env[{','.join(sorted(changed_keys))[:40]}] -> {len(hit)}")
-                                _reg_skipped = True
-
-                            # Rule 3: expression class _sql_names list edits
-                            elif old.startswith("sqlglot/expressions/") and all(
-                                    r["scope"].endswith("._sql_names") and r["kind"] == "list_items"
-                                    for r in recs):
-                                cls_names = {r["scope"].split(".", 1)[0] for r in recs}
-                                str_keys = {k for r in recs for k in (
-                                    r["changed_keys"] + r["added_keys"] + r["removed_keys"])
-                                    if not k.startswith("<")}
-                                all_cls = set(cls_names)
-                                if cls_names:
-                                    sub_pat = re.compile(r"class\s+(\w+)\s*\([^)]*\b(?:"
-                                                         + "|".join(re.escape(c) for c in cls_names) + r")\b")
-                                    for rel in mp.lines:
-                                        if rel.startswith("sqlglot/expressions/") and rel.endswith(".py"):
-                                            for line in source_lines(rel) or []:
-                                                m = sub_pat.search(line)
-                                                if m:
-                                                    all_cls.add(m.group(1))
-                                hit = set()
-                                for c in all_cls:
-                                    hit |= name_users(mp, c)
-                                for s in stmts:
-                                    if s[2] == "ClassDef" and any(s[3] <= ln <= s[4] for ln in touched):
-                                        hit |= mp.range_tests(old, s[3], s[4])
-                                hit |= _tests_mentioning_tokens(mp, str_keys, tests_by_file)
-                                low_keys = {k.lower() for k in str_keys}
-
-                                def _sqlnames_tpc(bench):
-                                    b = ops.get(bench) or {}
-                                    if any(c in b["exprs"] or c.lower() in b["exprs_lower"] for c in all_cls):
-                                        return True
-                                    return bool(low_keys & b["tokens_lower"])
-
-                                if _sqlnames_tpc("tpcds"):
-                                    for tid in (EXEC_TPCDS, OPT_TPCDS):
-                                        num = TEST_NUM.get(tid)
-                                        if num is not None:
-                                            hit.add(num)
-                                if _sqlnames_tpc("tpch"):
-                                    for tid in (EXEC_TPCH, OPT_TPCH):
+                                    hit |= (name_users(mp, k) | expr_class_users(mp, k.lower())) & exec_scope
+                                for tid in (EXEC_TPCDS, EXEC_TPCH, OPT_TPCH_EXEC):
+                                    num = TEST_NUM.get(tid)
+                                    if num is not None:
+                                        hit.discard(num)
+                                if _env_hit("tpcds"):
+                                    num = TEST_NUM.get(EXEC_TPCDS)
+                                    if num is not None:
+                                        hit.add(num)
+                                if _env_hit("tpch"):
+                                    for tid in (EXEC_TPCH, OPT_TPCH_EXEC):
                                         num = TEST_NUM.get(tid)
                                         if num is not None:
                                             hit.add(num)
                                 if bonus is not None:
-                                    bonus[2] |= mp.file_tests(old)
+                                    bonus[2] |= (mp.file_tests(old) - tpc_skip) - hit
                                 sel |= hit
-                                reasons.append(f"regdiff-sqlnames[{','.join(sorted(cls_names))}] -> {len(hit)}")
+                                reasons.append(f"regdiff-env[{','.join(sorted(changed_keys))[:40]}] -> {len(hit)}")
                                 _reg_skipped = True
+
+                            # Rule 3: expression class _sql_names / arg_types / is_var_len_args edits
+                            elif old.startswith("sqlglot/expressions/") \
+                                    and old != "sqlglot/expressions/core.py" \
+                                    and all(any(r["scope"].endswith(sfx) for sfx in (
+                                        "._sql_names", ".arg_types", ".is_var_len_args"))
+                                        for r in recs):
+                                cls_names = {r["scope"].split(".", 1)[0] for r in recs if "." in r["scope"]}
+                                em = _load_expr_map()
+                                if cls_names and em["exprs"] and not (cls_names & em["import_core"]):
+                                    str_tokens = {k for r in recs for k in (
+                                        r["changed_keys"] + r["added_keys"] + r["removed_keys"])
+                                        if not k.startswith("<")}
+                                    has_sql_names = any(r["scope"].endswith("._sql_names") for r in recs)
+                                    has_arg_types = any(r["scope"].endswith(".arg_types") for r in recs)
+                                    all_cls = set(cls_names)
+                                    # Subclasses AND sibling classes that copy arg_types/_sql_names (e.g. Revoke = Grant.arg_types)
+                                    ref_pat = re.compile(r"\b(?:" + "|".join(re.escape(c) for c in cls_names) + r")\b")
+                                    cls_hdr = re.compile(r"^class\s+(\w+)\b")
+                                    for rel in mp.lines:
+                                        if rel.startswith("sqlglot/expressions/") and rel.endswith(".py"):
+                                            cur_cls = None
+                                            for line in source_lines(rel) or []:
+                                                mc = cls_hdr.match(line)
+                                                if mc:
+                                                    cur_cls = mc.group(1)
+                                                elif line and not line[0].isspace():
+                                                    cur_cls = None
+                                                if cur_cls and cur_cls not in all_cls and ref_pat.search(line):
+                                                    all_cls.add(cur_cls)
+                                    hit = set()
+                                    for c in all_cls:
+                                        hit |= set(em["exprs"].get(c, ()))
+                                        for dname in em["import_dialects"].get(c, ()):
+                                            hit |= dialect_dependents(f"sqlglot/dialects/{dname}.py")
+                                            if dname == "duckdb":
+                                                hit |= duckdb_users(mp)
+                                    imp_lines = mp.imp.get(old, ())
+                                    for s in stmts:
+                                        if s[2] == "ClassDef":
+                                            m = re.match(r"\s*class\s+(\w+)", src[s[3] - 1])
+                                            if m and m.group(1) in cls_names:
+                                                for kln in range(s[3], s[4] + 1):
+                                                    if kln not in imp_lines:
+                                                        lt = mp.line_tests(old, kln)
+                                                        if lt:
+                                                            hit |= lt
+                                    if has_sql_names:
+                                        hit |= _tests_mentioning_tokens(mp, str_tokens, tests_by_file)
+                                    if has_arg_types and (all_cls & IMPORT_PARSED):
+                                        hit |= duckdb_users(mp)
+                                    ds_ops = ops.get("tpcds") or {}
+                                    ch_ops = ops.get("tpch") or {}
+                                    if all_cls & set(ds_ops.get("exprs", ())):
+                                        for tid in (EXEC_TPCDS, OPT_TPCDS):
+                                            num = TEST_NUM.get(tid)
+                                            if num is not None:
+                                                hit.add(num)
+                                    if all_cls & set(ch_ops.get("exprs", ())):
+                                        for tid in (EXEC_TPCH, OPT_TPCH):
+                                            num = TEST_NUM.get(tid)
+                                            if num is not None:
+                                                hit.add(num)
+                                    if bonus is not None:
+                                        bonus[2] |= mp.file_tests(old) - hit
+                                    sel |= hit
+                                    reasons.append(f"regdiff-expr[{','.join(sorted(cls_names))[:50]}] -> {len(hit)}")
+                                    _reg_skipped = True
 
                             # Rule 4: dialect Parser.FUNCTIONS / Generator.TRANSFORMS key edit
                             elif old.startswith(("sqlglot/parsers/", "sqlglot/generators/")) \
@@ -1307,7 +1596,19 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests, bonus=None):
                                     for e in expr_names:
                                         expr_hits |= name_users(mp, e)
                                         expr_hits |= expr_class_users(mp, e.lower())
-                                    hit = (expr_hits | _tests_mentioning_tokens(mp, str_keys, tests_by_file)) & scope
+                                    line_hits = set()
+                                    imp_lines = mp.imp.get(old, ())
+                                    for ln in touched:
+                                        if ln not in imp_lines:
+                                            line_hits |= mp.line_tests(old, ln) or set()
+                                    for r in recs:
+                                        for lo_c, hi_c in r.get("changed_spans", ()):
+                                            for kln in range(lo_c, hi_c + 1):
+                                                if kln not in imp_lines:
+                                                    lt = mp.line_tests(old, kln)
+                                                    if lt:
+                                                        line_hits |= lt
+                                    hit = ((expr_hits | _tests_mentioning_tokens(mp, str_keys, tests_by_file)) & scope) | line_hits
                                     if hit and (str_keys or expr_names):
                                         if bonus is not None:
                                             bonus[2] |= (scope - hit)  # free idle-worker fill
@@ -1336,7 +1637,22 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests, bonus=None):
                 if verified:
                     # collection succeeded, but a dialect/module-family runtime test can still
                     # fail at import time; keep it even after clearing the collection rule
-                    fam_hit = stem_users(mp, old) or mp.file_tests(old)
+                    fam_hit = None
+                    if old.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/",
+                                       "sqlglot/tokenizers/", "sqlglot/typing/")) \
+                            and not old.endswith(("/__init__.py", "/dialect.py", "/parser.py",
+                                                  "/generator.py")):
+                        dd = dialect_dependents(old)
+                        own = {k for fl, ks in tests_by_file.items()
+                               if fl.rsplit("/", 1)[-1] == f"test_{_stem(old)}.py" for k in ks}
+                        su = stem_users(mp, old) or set()
+                        cand_fam = ((dd & su) | own) if (dd and su) else (dd | own)
+                        if cand_fam:
+                            fam_hit = cand_fam
+                            if bonus is not None:
+                                bonus[2] |= su - fam_hit
+                    if fam_hit is None:
+                        fam_hit = stem_users(mp, old) or mp.file_tests(old)
                     sel |= fam_hit
                     reasons.append(f"collection-ok {old} -> {len(verified)} files, fam {len(fam_hit)}")
             if not old.startswith(("sqlglot/", "tests/")):
@@ -1352,6 +1668,9 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests, bonus=None):
                     sel |= own
                     reasons.append(f"testfile {old} -> {len(own)}")
         else:
+            if EQUIV and _sql_fixture_equiv(old, f, patch_text):
+                reasons.append(f"fixture-same {old}")
+                continue
             i = mp.opens.get(old)
             tpc = TPC_CONSUMERS.get(old)
             if tpc is not None and f["new"] == old and _tpc_fixture_parses_cleanly(old, f, patch_text):
@@ -1764,34 +2083,41 @@ def verify_imports(plans, mp, tests_by_file, ms, t_start):
                     if m.endswith("/__init__"):
                         m = m[: -len("/__init__")]
                     mods.add(m.replace("/", "."))
-        test_mods = [f"{fl}={fl[:-3].replace('/', '.')}" for fl in sorted(cfiles_all)]
+        test_pairs = [(fl, fl[:-3].replace("/", ".")) for fl in sorted(cfiles_all)]
         ok, why = False, ""
         ok_tests = set()
-        try:
-            changes = runner.apply_patch(p[1], str(SRC))
-            if os.path.exists(runner.RUN_DIR):
+        if hasattr(runner, "check_imports"):
+            res = runner.check_imports(p[1], sorted(mods), test_pairs, src_root=str(SRC), timeout_s=30.0)
+            ok = bool(res.get("ok"))
+            why = res.get("why") or ""
+            ok_tests = set(res.get("ok_tests") or ())
+        else:
+            test_mods = [f"{fl}={m}" for fl, m in test_pairs]
+            try:
+                changes = runner.apply_patch(p[1], str(SRC))
+                if os.path.exists(runner.RUN_DIR):
+                    shutil.rmtree(runner.RUN_DIR, ignore_errors=True)
+                os.makedirs(runner.RUN_DIR, exist_ok=True)
+                runner.build_tree(str(SRC), changes)
+                env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", SKIP_INTEGRATION="0")
+                cmd = [sys.executable, "-I", "-c", _IMPORT_CHECK, runner.TREE] + sorted(mods)
+                if test_mods:
+                    cmd += ["--tests"] + test_mods
+                r = subprocess.run(cmd, env=env, timeout=30, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, cwd=runner.RUN_DIR)
+                ok = r.returncode == 0
+                why = "" if ok else (r.stderr.strip().splitlines() or ["failed"])[-1][:80]
+                if test_mods and ok:
+                    try:
+                        lines_out = [ln for ln in r.stdout.splitlines() if ln.strip()]
+                        if lines_out:
+                            ok_tests = set(json.loads(lines_out[-1])["ok"])
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception as ex:  # noqa: BLE001
+                why = f"error {ex!r}"[:80]
+            finally:
                 shutil.rmtree(runner.RUN_DIR, ignore_errors=True)
-            os.makedirs(runner.RUN_DIR, exist_ok=True)
-            runner.build_tree(str(SRC), changes)
-            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", SKIP_INTEGRATION="0")
-            cmd = [sys.executable, "-I", "-c", _IMPORT_CHECK, runner.TREE] + sorted(mods)
-            if test_mods:
-                cmd += ["--tests"] + test_mods
-            r = subprocess.run(cmd, env=env, timeout=30, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, cwd=runner.RUN_DIR)
-            ok = r.returncode == 0
-            why = "" if ok else (r.stderr.strip().splitlines() or ["failed"])[-1][:80]
-            if test_mods and ok:
-                try:
-                    lines_out = [ln for ln in r.stdout.splitlines() if ln.strip()]
-                    if lines_out:
-                        ok_tests = set(json.loads(lines_out[-1])["ok"])
-                except Exception:  # noqa: BLE001
-                    pass
-        except Exception as ex:  # noqa: BLE001
-            why = f"error {ex!r}"[:80]
-        finally:
-            shutil.rmtree(runner.RUN_DIR, ignore_errors=True)
         if ok:
             IMPORT_OK.clear()
             IMPORT_OK.update(rels | c_rels)
@@ -2069,7 +2395,7 @@ EXPENSIVE_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")
 RUN_MAX_EST_S = float(os.environ.get("BR_RUN_MAX", "1.0"))
 RUN_BUDGET_S = float(os.environ.get("BR_RUN_BUDGET", "60"))
 RUN_ENABLED = os.environ.get("BR_RUN", "0") == "1"
-FAST_RUN_ENABLED = os.environ.get("BR_FAST_RUN", "0") == "1"
+FAST_RUN_ENABLED = os.environ.get("BR_FAST_RUN", "1") == "1"
 FAST_RUN_MAX_S = float(os.environ.get("BR_FAST_MAX", "3.0"))
 FAST_RUN_BUDGET_S = float(os.environ.get("BR_FAST_BUDGET", "25.0"))
 
@@ -2097,9 +2423,23 @@ def fast_run_candidates(plans, meta, num, ids, ms, t_start):
             continue  # single fixture opener: one test, no useful ROI
         if any((meta.get(k) or ("", 0))[0] in EXPENSIVE_FILES for k in p[2]):
             continue
-        est = 0.16 + sum(meta[k][1] * 1.15 + 0.005 for k in p[2] if k in meta)
+        if any(r.startswith("header:") for r in p[3]):
+            continue  # signature/name edits almost always fail their callers -> poor replay ROI
+        n_files = len({meta[k][0] for k in p[2] if k in meta})
+        est = 0.14 + 0.06 * n_files + sum(meta[k][1] * 1.15 + 0.004 for k in p[2] if k in meta)
         packed_s = pack(p[2], ms)[0] / 1000.0
-        if est <= FAST_RUN_MAX_S and est < packed_s * 0.65 and packed_s - est >= 0.8:
+        # Only replay high-ROI over-selected commits (added handlers, registry/import-time hits,
+        # or expensive multi-worker selections); skip header edits and tiny plain commits.
+        is_added = any(r.startswith("added[") for r in p[3])
+        has_high_roi = is_added or any(
+            r.startswith(("importtime[", "regdiff-", "collection-ok"))
+            for r in p[3]
+        )
+        if not (has_high_roi or packed_s >= 4.0):
+            continue
+        if not (is_added or any(r.startswith("regdiff-") for r in p[3])) and packed_s < 2.35:
+            continue
+        if est <= FAST_RUN_MAX_S and est < packed_s * 0.65 and packed_s - est >= 1.0:
             eligible.append((-(packed_s - est), p))
     if not eligible:
         return

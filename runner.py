@@ -207,7 +207,30 @@ def _apply_hunks(text, hunks, name):
         if pos is None:
             pos = _find([x.rstrip("\r") for x in L], [x.rstrip("\r") for x in old], want, last)
             if pos is None:
-                raise PatchError(f"hunk @@ -{o_start},{o_len} does not apply to {name}")
+                # A hunk that edits/appends at EOF can carry a synthetic trailing
+                # blank context line (" " -> "") even though _split stripped the
+                # file's final "\n", making len(old) exceed len(L) - pos by one.
+                # Retry the match at EOF with that trailing "" dropped.
+                if not noeol and old and old[-1] == "" and len(old) >= 2:
+                    old_trim = old[:-1]
+                    if len(L) >= len(old_trim):
+                        pos_eof = len(L) - len(old_trim)
+                        if pos_eof >= last and (
+                            L[pos_eof:] == old_trim
+                            or [x.rstrip("\r") for x in L[pos_eof:]]
+                            == [x.rstrip("\r") for x in old_trim]
+                        ):
+                            pos = pos_eof
+                            old = old_trim
+                            # Only drop the synthetic EOF "new" blank line when the
+                            # hunk's last body line is that empty context line. When
+                            # it is a "+" (e.g. appending a method), keep new as-is
+                            # so the blank separator before the new code survives.
+                            if (body and body[-1][0] == " " and body[-1][1] == ""
+                                    and new and new[-1] == ""):
+                                new = new[:-1]
+                if pos is None:
+                    raise PatchError(f"hunk @@ -{o_start},{o_len} does not apply to {name}")
         at_end = pos + len(old) == len(L)
         L[pos:pos + len(old)] = new
         last = pos + len(new)
@@ -389,7 +412,7 @@ def _try(m):
         pass
 
 if lite:
-    for m in ("unittest", "unittest.mock", "json", "tempfile", "decimal", "datetime", "importlib"):
+    for m in ("unittest", "unittest.mock", "json", "tempfile", "decimal", "datetime", "importlib", "sqlglot"):
         _try(m)
 else:
     for m in ("unittest", "unittest.mock", "json", "sqlite3", "tempfile", "decimal", "datetime",
@@ -507,11 +530,41 @@ def child(req):
     os.environ.pop("PYTHONPATH", None)
     os.chdir(tree)
     sys.dont_write_bytecode = bool(req["dwb"])
-    purge = ("tests",) + (("sqlglot",) if req["purge"] else ())
+    cmods = req.get("changed_mods")
+    if not req["purge"]:
+        need_purge = False
+    elif cmods is not None and "__NON_PY__" not in cmods:
+        need_purge = any(m in sys.modules for m in cmods)
+    else:
+        need_purge = True
+    purge = ("tests",) + (("sqlglot",) if need_purge else ())
     for name in list(sys.modules):
         if name.split(".", 1)[0] in purge:
             del sys.modules[name]
     importlib.invalidate_caches()
+    if req.get("op") == "import_check":
+        res = {"ok": False, "why": "", "ok_tests": []}
+        try:
+            import sqlglot
+            if not os.path.abspath(sqlglot.__file__).startswith(tree + os.sep):
+                raise RuntimeError("sqlglot imported from outside the run tree")
+            for m in req["sql_mods"]:
+                importlib.import_module(m)
+            ok_t = []
+            for fl, m in req["test_mods"]:
+                try:
+                    importlib.import_module(m)
+                    ok_t.append(fl)
+                except BaseException:
+                    pass
+            res = {"ok": True, "why": "", "ok_tests": ok_t}
+        except BaseException as e:
+            res = {"ok": False, "why": f"{type(e).__name__}: {e}"[:80], "ok_tests": []}
+        tmp = req["out"] + ".part"
+        with open(tmp, "w") as f:
+            json.dump(res, f)
+        os.replace(tmp, req["out"])
+        return 0
     if req["fork_pool"]:
         import multiprocessing
         orig = multiprocessing.get_context
@@ -640,11 +693,11 @@ _STATS = {"calls": 0, "zygote_starts": 0, "startup_cpu_s": 0.0}
 def _zygote(src_root, lite=False):
     global _Z, _Z_LITE
     if lite:
-        if _Z_LITE is not None and _Z_LITE.proc.poll() is not None:
+        if _Z_LITE is not None and (_Z_LITE.src_root != src_root or _Z_LITE.proc.poll() is not None):
             _Z_LITE.close()
             _Z_LITE = None
         if _Z_LITE is None:
-            os.makedirs(TREE, exist_ok=True)  # _ZYGOTE chdirs here; nothing is preloaded from src_root
+            build_tree(src_root, {})  # pristine tree so preloaded sqlglot.__path__ points inside TREE
             info = _src_info(src_root)
             _Z_LITE = _Zygote(src_root, preload=False, dwb=info["prebuilt"], lite=True)
             _STATS["zygote_starts"] += 1
@@ -682,6 +735,69 @@ def _kill_group(pid):
             pass
 
 
+def _changed_sqlglot_mods(changes):
+    mods = []
+    for r in changes:
+        if not r.startswith("sqlglot/"):
+            continue
+        if not r.endswith(".py"):
+            mods.append("__NON_PY__")
+            continue
+        m = r[:-3]
+        if m.endswith("/__init__"):
+            m = m[:-len("/__init__")]
+        mods.append(m.replace("/", "."))
+    return mods
+
+
+def check_imports(patch_text, sql_mods, test_mods, src_root="/sqlglot", timeout_s=30.0):
+    """Import sql_mods (and optional [(file, mod), ...] test_mods) on the patched tree via _Z_LITE."""
+    global _Z_LITE
+    try:
+        changes = apply_patch(patch_text, src_root)
+    except (PatchError, ValueError, UnicodeError) as e:
+        return {"ok": False, "why": f"patch: {e}"[:80], "ok_tests": []}
+    out = os.path.join(RUN_DIR, "imp_result.json")
+    pid = None
+    try:
+        z, _startup = _zygote(src_root, lite=True)
+        build_tree(src_root, changes)
+        _rmtree(out)
+        z.send({
+            "op": "import_check",
+            "sql_mods": list(sql_mods),
+            "test_mods": list(test_mods),
+            "out": out,
+            "tmp": os.path.join(RUN_DIR, "tmp"),
+            "timeout": timeout_s,
+            "purge": any(r.split("/", 1)[0] == "sqlglot" for r in changes),
+            "changed_mods": _changed_sqlglot_mods(changes),
+            "dwb": z.dwb,
+            "fork_pool": False,
+        })
+        deadline = time.monotonic() + timeout_s
+        msg = z.read(30.0)
+        if not msg or "pid" not in msg:
+            raise RuntimeError("zygote did not fork")
+        pid = msg["pid"]
+        msg = z.read(max(0.0, deadline - time.monotonic()))
+        if msg is None:
+            _kill_group(pid)
+            z.read(30.0)
+            return {"ok": False, "why": f"timeout after {timeout_s}s", "ok_tests": []}
+        with open(out) as f:
+            return json.load(f)
+    except Exception as e:
+        if pid:
+            _kill_group(pid)
+        if _Z_LITE is not None:
+            _Z_LITE.close()
+            _Z_LITE = None
+        return {"ok": False, "why": f"error {e!r}"[:80], "ok_tests": []}
+    finally:
+        _rmtree(RUN_DIR)
+
+
 def run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, _fork_pool=True, lite=False):
     global _Z, _Z_LITE
     t_wall = time.monotonic()
@@ -712,6 +828,7 @@ def run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, _fork_p
         _rmtree(out)
         z.send({"ids": ids, "out": out, "tmp": os.path.join(RUN_DIR, "tmp"), "timeout": timeout_s,
                 "purge": any(r.split("/", 1)[0] == "sqlglot" for r in changes),
+                "changed_mods": _changed_sqlglot_mods(changes),
                 "dwb": z.dwb, "fork_pool": bool(_fork_pool)})
         deadline = time.monotonic() + timeout_s
         msg = z.read(30.0)

@@ -371,12 +371,21 @@ def _describe_changed(scope, old_slot, new_slot):
         return None
 
     old_val, new_val = old_slot[1], new_slot[1]
+    if old_val is None or new_val is None:
+        if old_val is None and new_val is None:
+            return None
+        return {
+            "scope": scope, "kind": "value",
+            "changed_keys": ["<value>"], "added_keys": [], "removed_keys": [],
+            "expr_names": [], "str_keys": [], "changed_spans": [],
+        }
     if ast.dump(old_val) == ast.dump(new_val):
         return None
 
     kind = "value"
     changed, added, removed = [], [], []
     affected = []  # (key_node_or_None, value_node_or_None)
+    changed_spans = []  # (lo, hi) line spans in OLD source for changed/removed dict values
 
     if isinstance(old_val, ast.Dict) and isinstance(new_val, ast.Dict):
         kind = "dict_keys"
@@ -385,6 +394,8 @@ def _describe_changed(scope, old_slot, new_slot):
             if k_id not in nm:
                 removed.append(_key_label(key))
                 affected.append((key, value))
+                if getattr(value, "lineno", None) and getattr(value, "end_lineno", None):
+                    changed_spans.append((value.lineno, value.end_lineno))
         for k_id, (key, value) in nm.items():
             if k_id not in om:
                 added.append(_key_label(key))
@@ -395,6 +406,8 @@ def _describe_changed(scope, old_slot, new_slot):
                 if ast.dump(old_v) != ast.dump(new_v):
                     changed.append(_key_label(key))
                     affected.append((key, new_v))
+                    if getattr(old_v, "lineno", None) and getattr(old_v, "end_lineno", None):
+                        changed_spans.append((old_v.lineno, old_v.end_lineno))
 
     elif isinstance(old_val, (ast.List, ast.Set, ast.Tuple)) and isinstance(
         new_val, (ast.List, ast.Set, ast.Tuple)
@@ -437,6 +450,7 @@ def _describe_changed(scope, old_slot, new_slot):
         "removed_keys": sorted(removed),
         "expr_names": sorted(exprs),
         "str_keys": sorted(strs),
+        "changed_spans": changed_spans,
     }
 
 
