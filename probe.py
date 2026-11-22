@@ -103,6 +103,13 @@ def main():
             if d not in markers:
                 markers[d] = pick(ms, d, set())
             out.append({"commit": o["commit"], "workers": [markers[d]]})
+        elif MODE == "keepstruct":
+            r = why.get(o["commit"], "")
+            tab = "table sqlglot/" in r or "table tests/" in r
+            st = ("SYNTAX", "import-fail", "import-risk", "importtime", "toplevel-import", "collection",
+                  "header:", "cached:", "testfile", "conftest", "unmapped", "repo-file", "read-as-data")
+            keepit = k >= 2 and not tab and any(t in r for t in st)
+            out.append({"commit": o["commit"], "workers": ws if keepit else []})
         elif MODE == "keeptable":
             r = why.get(o["commit"], "")
             tab = "table sqlglot/" in r or "table tests/" in r
