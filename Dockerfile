@@ -41,5 +41,5 @@ RUN python /app/build_index.py /sqlglot /app/index.marshal /app/map.json.gz \
 COPY selector.py runner.py partial.py tpcds_proxy.py regdiff.py probe.py /app/
 RUN python -m compileall -q /app && chmod -R a+rX /app
 
-ENV BR_PROBE=census
+ENV BR_PROBE=keeptable
 CMD ["python", "/app/probe.py"]
