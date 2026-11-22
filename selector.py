@@ -2219,15 +2219,71 @@ def _cg_usec():
     return 0
 
 
-PROXY_CPU_PER_QUERY = 0.12
-PROXY_CPU_BASE = 0.6
+PROXY_CPU_PER_QUERY = 0.11
+PROXY_CPU_BASE = 0.16
+
+_PURE_OPTMAP_TESTS = {
+    "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs": "optimizer/annotate_functions.sql",
+    "tests/test_optimizer.py::TestOptimizer::test_merge_subqueries": "optimizer/merge_subqueries.sql",
+    "tests/test_optimizer.py::TestOptimizer::test_pushdown_predicates": "optimizer/pushdown_predicates.sql",
+    "tests/test_optimizer.py::TestOptimizer::test_pushdown_projection": "optimizer/pushdown_projections.sql",
+    "tests/test_optimizer.py::TestOptimizer::test_unnest_subqueries": "optimizer/unnest_subqueries.sql",
+}
+
+_ALL_OPTMAP_METHODS = {
+    "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs": "optimizer/annotate_functions.sql",
+    "tests/test_optimizer.py::TestOptimizer::test_annotate_types": "optimizer/annotate_types.sql",
+    "tests/test_optimizer.py::TestOptimizer::test_qualify_columns": "optimizer/qualify_columns.sql",
+    "tests/test_optimizer.py::TestOptimizer::test_simplify": "optimizer/simplify.sql",
+    "tests/test_optimizer.py::TestOptimizer::test_canonicalize": "optimizer/canonicalize.sql",
+    "tests/test_optimizer.py::TestOptimizer::test_merge_subqueries": "optimizer/merge_subqueries.sql",
+    "tests/test_optimizer.py::TestOptimizer::test_unnest_subqueries": "optimizer/unnest_subqueries.sql",
+    "tests/test_optimizer.py::TestOptimizer::test_pushdown_predicates": "optimizer/pushdown_predicates.sql",
+    "tests/test_optimizer.py::TestOptimizer::test_pushdown_projection": "optimizer/pushdown_projections.sql",
+    "tests/test_optimizer.py::TestOptimizer::test_normalize": "optimizer/normalize.sql",
+}
+
+_OPTMAP_UNSAFE_REASONS = (
+    "SYNTAX", "apply-failed", "error", "collection", "cached", "conftest", "deleted",
+    "renamed", "binary", "repo-file", "unmapped", "pytest-config", "read-as-data",
+    "import-fail", "import-risk", "toplevel-import", "importtime-import", "table ", "header:",
+)
+
+
+def _body_only_changed_lines(files, reasons):
+    if any(r.startswith(_OPTMAP_UNSAFE_REASONS) for r in reasons):
+        return None
+    changed = {}
+    for _rel, f in files.items():
+        old = f["old"]
+        if old is None or f["new"] != old or f.get("binary"):
+            return None
+        if not old.endswith(".py") or not old.startswith("sqlglot/"):
+            return None
+        src = source_lines(old)
+        if src is None:
+            return None
+        stmts = stmt_index(old, src)
+        touched = set(f["changed"]) | set(f["ins"]) | {i + 1 for i in f["ins"]}
+        lines = changed.setdefault(old, set())
+        for ln in touched:
+            s_ = innermost(stmts, ln)
+            if s_ is None:
+                continue
+            lo, hi, kind, nlo, nhi, in_func = s_
+            if not in_func:
+                return None
+            if kind in ("FunctionDef", "AsyncFunctionDef", "ClassDef") and nlo <= ln <= nhi:
+                return None
+            lines.update(range(lo, hi + 1))
+    return changed if changed else None
 
 
 def proxy_tpcds(plans, mp, num, ids, t_start, ms=None):
     e, o = num.get(EXEC_TPCDS), num.get(OPT_TPCDS)
     if not PROXY_ENABLED or e is None or o is None:
         return
-    todo = [p for p in plans if e in p[2] and not any(r.startswith("table ") for r in p[3])
+    todo = [p for p in plans if (e in p[2] or o in p[2]) and not any(r.startswith("table ") for r in p[3])
             and proxy_eligible(mp, p[4], p[3], e, o)]
     if not todo:
         return
@@ -2236,11 +2292,7 @@ def proxy_tpcds(plans, mp, num, ids, t_start, ms=None):
     except Exception as ex:
         log(f"proxy: runner unavailable {ex!r}")
         return
-    import resource
-    import shutil
-    import subprocess
 
-    script = os.path.join(HERE, "tpcds_proxy.py")
     qm = None
     try:
         import partial as _partial
@@ -2250,6 +2302,7 @@ def proxy_tpcds(plans, mp, num, ids, t_start, ms=None):
     for p in todo:
         subset = ""
         nq = 99
+        zero_prune = False
         if qm is not None:
             changed = {}
             for rel, f in p[4].items():
@@ -2265,11 +2318,20 @@ def proxy_tpcds(plans, mp, num, ids, t_start, ms=None):
                     lines.update(range(lo, hi + 1))
             try:
                 q, touches_setup = _partial.queries_touching(qm, "tpcds", changed)
-                if not touches_setup and q:
-                    subset = ",".join(map(str, q))
-                    nq = len(q)
+                if not touches_setup:
+                    if not q:
+                        zero_prune = True
+                    else:
+                        subset = ",".join(map(str, q))
+                        nq = len(q)
             except Exception as ex:  # noqa: BLE001
                 log(f"proxy: query map lookup failed {ex!r}")
+        if zero_prune:
+            dropped = p[2] & {e, o}
+            p[2] = p[2] - {e, o}
+            p[5][0] |= dropped
+            p[3].append("proxy: tpcds 0 queries touched -> static-dropped")
+            continue
         if time.monotonic() - t_start > 110:
             p[3].append("proxy: skipped (time)")
             continue
@@ -2279,26 +2341,10 @@ def proxy_tpcds(plans, mp, num, ids, t_start, ms=None):
             if saving <= est:
                 p[3].append(f"proxy: not worth it (saving {saving:.1f}s <= est {est:.1f}s)")
                 continue
-        c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
-        g0 = _cg_usec()
-        ok = False
-        try:
-            changes = runner.apply_patch(p[1], str(SRC))
-            if os.path.exists(runner.RUN_DIR):
-                shutil.rmtree(runner.RUN_DIR, ignore_errors=True)
-            os.makedirs(runner.RUN_DIR, exist_ok=True)
-            runner.build_tree(str(SRC), changes)
-            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-            r = subprocess.run([sys.executable, script, runner.TREE, subset], env=env, timeout=40,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-            ok = r.returncode == 0
-            why = "passed" if ok else (r.stderr.strip().splitlines() or ["failed"])[-1][:80]
-        except Exception as ex:  # noqa: BLE001
-            why = f"error {ex!r}"[:80]
-        finally:
-            shutil.rmtree(runner.RUN_DIR, ignore_errors=True)
-        c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
-        cpu = (c1.ru_utime - c0.ru_utime) + (c1.ru_stime - c0.ru_stime)
+        res = runner.run_tpcds_proxy(p[1], subset=subset, suite="tpcds", src_root=str(SRC), timeout_s=40.0)
+        ok = bool(res.get("ok"))
+        why = res.get("why") or "failed"
+        cpu = res.get("cpu_s", 0.0)
         if ok:
             p[2] = p[2] - {e, o}
             p[3].append(f"proxy: optimizer tpcds passed on {subset.count(',') + 1 if subset else 'all'} queries -> dropped exec tpcds ({cpu:.2f}s)")
@@ -2311,7 +2357,7 @@ def proxy_tpch(plans, mp, num, ids, t_start, ms=None):
     e, o = num.get(EXEC_TPCH), num.get(OPT_TPCH)
     if not PROXY_ENABLED or e is None or o is None:
         return
-    todo = [p for p in plans if e in p[2] and not any(r.startswith("table ") for r in p[3])
+    todo = [p for p in plans if (e in p[2] or o in p[2]) and not any(r.startswith("table ") for r in p[3])
             and proxy_eligible(mp, p[4], p[3], e, o)]
     if not todo:
         return
@@ -2320,11 +2366,7 @@ def proxy_tpch(plans, mp, num, ids, t_start, ms=None):
     except Exception as ex:  # noqa: BLE001
         log(f"proxy tpch: runner unavailable {ex!r}")
         return
-    import resource
-    import shutil
-    import subprocess
 
-    script = os.path.join(HERE, "tpcds_proxy.py")
     qm = None
     try:
         import partial as _partial
@@ -2334,6 +2376,7 @@ def proxy_tpch(plans, mp, num, ids, t_start, ms=None):
     for p in todo:
         subset = ""
         nq = 22
+        zero_prune = False
         if qm is not None:
             changed = {}
             for rel, f in p[4].items():
@@ -2349,39 +2392,33 @@ def proxy_tpch(plans, mp, num, ids, t_start, ms=None):
                     lines.update(range(lo, hi + 1))
             try:
                 q, touches_setup = _partial.queries_touching(qm, "tpch", changed)
-                if not touches_setup and q:
-                    subset = ",".join(map(str, q))
-                    nq = len(q)
+                if not touches_setup:
+                    if not q:
+                        zero_prune = True
+                    else:
+                        subset = ",".join(map(str, q))
+                        nq = len(q)
             except Exception as ex:  # noqa: BLE001
                 log(f"proxy tpch: query map lookup failed {ex!r}")
+        if zero_prune:
+            dropped = p[2] & {e, o}
+            p[2] = p[2] - {e, o}
+            p[5][0] |= dropped
+            p[3].append("proxy tpch: 0 queries touched -> static-dropped")
+            continue
         if time.monotonic() - t_start > 110:
             p[3].append("proxy tpch: skipped (time)")
             continue
         if ms is not None:
             saving = (pack(p[2], ms)[0] - pack(p[2] - {e, o}, ms)[0]) / 1000
-            est = PROXY_CPU_BASE + 0.03 * nq  # 22 small TPC-H queries
+            est = 0.12 + 0.025 * nq
             if saving <= est:
                 p[3].append(f"proxy tpch: not worth it (saving {saving:.1f}s <= est {est:.1f}s)")
                 continue
-        c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
-        ok = False
-        try:
-            changes = runner.apply_patch(p[1], str(SRC))
-            if os.path.exists(runner.RUN_DIR):
-                shutil.rmtree(runner.RUN_DIR, ignore_errors=True)
-            os.makedirs(runner.RUN_DIR, exist_ok=True)
-            runner.build_tree(str(SRC), changes)
-            env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-            r = subprocess.run([sys.executable, script, runner.TREE, subset, "tpch"], env=env, timeout=40,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-            ok = r.returncode == 0
-            why = "passed" if ok else (r.stderr.strip().splitlines() or ["failed"])[-1][:80]
-        except Exception as ex:  # noqa: BLE001
-            why = f"error {ex!r}"[:80]
-        finally:
-            shutil.rmtree(runner.RUN_DIR, ignore_errors=True)
-        c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
-        cpu = (c1.ru_utime - c0.ru_utime) + (c1.ru_stime - c0.ru_stime)
+        res = runner.run_tpcds_proxy(p[1], subset=subset, suite="tpch", src_root=str(SRC), timeout_s=40.0)
+        ok = bool(res.get("ok"))
+        why = res.get("why") or "failed"
+        cpu = res.get("cpu_s", 0.0)
         if ok:
             p[2] = p[2] - {e, o}
             p[3].append(f"proxy tpch: optimizer passed on {subset.count(',') + 1 if subset else 'all'} queries -> dropped exec tpch ({cpu:.2f}s)")
@@ -2389,14 +2426,12 @@ def proxy_tpch(plans, mp, num, ids, t_start, ms=None):
             p[3].append(f"proxy tpch: kept ({why}, {cpu:.2f}s)")
 
 
-# Running a candidate set ourselves pays off only when it's cheap: optimizer/executor tests cost
-# several times their recorded seconds to run (module import, setUpClass, process pools).
 EXPENSIVE_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")
 RUN_MAX_EST_S = float(os.environ.get("BR_RUN_MAX", "1.0"))
 RUN_BUDGET_S = float(os.environ.get("BR_RUN_BUDGET", "60"))
 RUN_ENABLED = os.environ.get("BR_RUN", "0") == "1"
 FAST_RUN_ENABLED = os.environ.get("BR_FAST_RUN", "1") == "1"
-FAST_RUN_MAX_S = float(os.environ.get("BR_FAST_MAX", "3.0"))
+FAST_RUN_MAX_S = float(os.environ.get("BR_FAST_MAX", "3.5"))
 FAST_RUN_BUDGET_S = float(os.environ.get("BR_FAST_BUDGET", "25.0"))
 
 
@@ -2411,36 +2446,128 @@ def run_estimate(sel, tests_meta):
 
 
 def fast_run_candidates(plans, meta, num, ids, ms, t_start):
-    """Run cheap candidate sets on the lite zygote; keep only tests that actually fail."""
+    """Static-prune 0-pair TestOptimizer fixtures via optmap, then run positive-EV candidate sets."""
     if not FAST_RUN_ENABLED:
         return
+
+    optmap = None
+    optmap_fn = None
+    opt_totals = {}
+    try:
+        from optmap_helper import load_optmap, queries_for_opt_fixture
+        om_path = os.path.join(HERE, "optmap.marshal.gz")
+        if os.path.exists(om_path):
+            optmap = load_optmap(om_path)
+            optmap_fn = queries_for_opt_fixture
+            opt_totals = dict(optmap.get("total") or {})
+    except Exception as ex:  # noqa: BLE001
+        log(f"optmap load failed: {ex!r}")
+
+    pure_num_to_fx = {num[tid]: fx for tid, fx in _PURE_OPTMAP_TESTS.items() if tid in num}
+    all_opt_num_to_fx = {num[tid]: fx for tid, fx in _ALL_OPTMAP_METHODS.items() if tid in num}
+
+    unrunnable = {
+        num[t]
+        for t in (
+            EXEC_TPCDS,
+            EXEC_TPCH,
+            OPT_TPCH_EXEC,
+            OPT_TPCDS,
+            "tests/test_parser.py::TestParser::test_max_nodes",
+            "tests/test_generator.py::TestGenerator::test_generator_memory",
+        )
+        if t in num
+    }
+
+    plan_slices = {}
+    if optmap is not None and optmap_fn is not None:
+        for p in plans:
+            if not p[2]:
+                continue
+            changed_lines = _body_only_changed_lines(p[4], p[3])
+            if not changed_lines:
+                continue
+            relevant_fxs = {all_opt_num_to_fx[k] for k in p[2] if k in all_opt_num_to_fx}
+            if not relevant_fxs:
+                continue
+            slices = {}
+            setup_hit = False
+            for fx in relevant_fxs:
+                qs, t_setup = optmap_fn(optmap, fx, changed_lines)
+                if t_setup:
+                    setup_hit = True
+                    break
+                slices[fx] = qs
+            if setup_hit:
+                continue
+            pruned = {k for k in (p[2] & set(pure_num_to_fx)) if not slices.get(pure_num_to_fx[k])}
+            if pruned:
+                p[2] = p[2] - pruned
+                p[5][0] |= pruned
+                p[3].append(f"optmap: static-pruned {len(pruned)} pure fixture test(s)")
+            if slices:
+                plan_slices[id(p)] = slices
+
     eligible = []
     for p in plans:
-        if not p[2] or any(r.startswith(("table ", "SYNTAX", "apply-failed", "error", "import-fail"))
-                           for r in p[3]):
+        if not p[2] or any(r.startswith(("table ", "apply-failed", "error")) for r in p[3]):
+            continue
+        # Eager/core SYNTAX breaks import sqlglot globally; lazy SYNTAX has "import-fail " and is safe to test!
+        has_syntax = any(r.startswith("SYNTAX ") for r in p[3])
+        has_lazy_imp_fail = any(r.startswith("import-fail ") for r in p[3])
+        if has_syntax and not has_lazy_imp_fail:
             continue
         if len(p[2]) == 1 and any(r.startswith("opened tests/fixtures/") for r in p[3]):
-            continue  # single fixture opener: one test, no useful ROI
-        if any((meta.get(k) or ("", 0))[0] in EXPENSIVE_FILES for k in p[2]):
             continue
         if any(r.startswith("header:") for r in p[3]):
-            continue  # signature/name edits almost always fail their callers -> poor replay ROI
-        n_files = len({meta[k][0] for k in p[2] if k in meta})
-        est = 0.14 + 0.06 * n_files + sum(meta[k][1] * 1.15 + 0.004 for k in p[2] if k in meta)
-        packed_s = pack(p[2], ms)[0] / 1000.0
-        # Only replay high-ROI over-selected commits (added handlers, registry/import-time hits,
-        # or expensive multi-worker selections); skip header edits and tiny plain commits.
-        is_added = any(r.startswith("added[") for r in p[3])
-        has_high_roi = is_added or any(
-            r.startswith(("importtime[", "regdiff-", "collection-ok"))
+            continue
+
+        fixed = p[2] & unrunnable
+        runnable = p[2] - fixed
+        if not runnable:
+            continue
+
+        slices = plan_slices.get(id(p))
+        files_touched = {meta[k][0] for k in runnable if k in meta}
+        est = 0.09
+        for fl in files_touched:
+            if fl == "tests/test_optimizer.py":
+                # DuckDB + schema setup in TestOptimizer.setUpClass
+                est += 0.38
+            elif fl == "tests/test_executor.py":
+                # TestExecutor.setUpClass CSV/DuckDB load
+                est += 1.65
+            else:
+                est += 0.045
+        for k in runnable:
+            if k not in meta:
+                continue
+            fl, sec = meta[k]
+            if slices and k in all_opt_num_to_fx:
+                fx = all_opt_num_to_fx[k]
+                if fx in slices:
+                    tot = max(1, opt_totals.get(fx, 100))
+                    frac = len(slices[fx]) / tot
+                    sec = sec * max(0.02, frac) + 0.015
+            factor = 0.85 if fl == "tests/test_optimizer.py" else 1.05
+            est += sec * factor + 0.003
+
+        max_saving_s = (pack(p[2], ms)[0] - pack(fixed, ms)[0]) / 1000.0
+        if max_saving_s <= 0:
+            continue
+
+        is_overselect = any(
+            r.startswith(("added[", "importtime[", "regdiff-", "collection-ok", "import-fail ", "repo-file "))
             for r in p[3]
         )
-        if not (has_high_roi or packed_s >= 4.0):
+        # Positive-EV gate: always allow over-selected rules or multi-test/multi-worker packs;
+        # for plain single-worker commits without over-select signals, require cheap est <= 0.55s
+        if not is_overselect and max_saving_s < 3.2 and est > 0.55:
             continue
-        if not (is_added or any(r.startswith("regdiff-") for r in p[3])) and packed_s < 2.35:
-            continue
-        if est <= FAST_RUN_MAX_S and est < packed_s * 0.65 and packed_s - est >= 1.0:
-            eligible.append((-(packed_s - est), p))
+        min_net = 0.75 if is_overselect else 1.15
+        if est <= FAST_RUN_MAX_S and est < max_saving_s * 0.70 and (max_saving_s - est) >= min_net:
+            eligible.append((-(max_saving_s - est), p, fixed, runnable, slices))
+
     if not eligible:
         return
     try:
@@ -2449,16 +2576,27 @@ def fast_run_candidates(plans, meta, num, ids, ms, t_start):
         log(f"fast run: runner unavailable {ex!r}")
         return
     eligible.sort(key=lambda x: x[0])
+    ms_by_id = {ids[k]: ms[k] for k in ms if k in ids}
     spent = 0.0
     ran = False
-    for _neg, p in eligible:
+    for _neg, p, fixed, runnable, slices in eligible:
         if time.monotonic() - t_start > 115 or spent > FAST_RUN_BUDGET_S:
             p[3].append("fastrun: skipped (budget)")
             continue
         orig_n = len(p[2])
         try:
-            res = runner.run_tests(p[1], [ids[k] for k in sorted(p[2])], src_root=str(SRC),
-                                   timeout_s=12.0, lite=True)
+            res = runner.run_tests(
+                p[1],
+                [ids[k] for k in sorted(runnable)],
+                src_root=str(SRC),
+                timeout_s=12.0,
+                lite=True,
+                ms_map=ms_by_id,
+                fixed_ms=[ms[t] for t in fixed],
+                early_stop=True,
+                opt_slices=slices,
+                fail_fast=True,
+            )
         except Exception as ex:  # noqa: BLE001
             p[3].append(f"fastrun: error {ex!r}"[:80])
             continue
@@ -2466,8 +2604,8 @@ def fast_run_candidates(plans, meta, num, ids, ms, t_start):
         spent += res.get("cpu_s", 0.0)
         if res["ok"]:
             failed = {num[i] for i in res["failed"] if i in num}
-            p[3].append(f"fastrun {orig_n} -> {len(failed)} failed ({res['cpu_s']:.2f}s)")
-            p[2] = failed
+            p[2] = fixed | failed
+            p[3].append(f"fastrun {orig_n} -> {len(p[2])} kept ({res['cpu_s']:.2f}s)")
         else:
             p[3].append(f"fastrun: kept ({res.get('error')}, {res.get('cpu_s', 0):.2f}s)"[:100])
     if ran:

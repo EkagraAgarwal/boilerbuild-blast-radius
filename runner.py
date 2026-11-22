@@ -1,31 +1,5 @@
-"""Verify-by-running: apply a patch to a cheap mirror of sqlglot in /tmp and run tests.
-
-    run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0) -> dict
-        {"failed": set(ids), "ok": bool, "cpu_s": float, "error": str|None, "detail": {...}}
-
-Design
-- The patched tree lives at /tmp/br_run/tree. Unchanged files/dirs are symlinks into the
-  read-only pristine checkout; only patched files are real copies. Every Python package
-  dir is a real dir of symlinks whose __pycache__ points at a persistent bytecode store
-  (/tmp/br_pyc) that only ever receives bytecode compiled from pristine sources, so
-  repeated runs skip compiling sqlglot. Dirs with a patched .py get a private
-  __pycache__ (deleted with the tree), so patched bytecode is never cached or reused.
-  If src_root already ships __pycache__ (compileall at build time), that is used instead.
-- A lazily started fork server ("zygote") pre-imports the heavy third-party modules the
-  tests use (unittest.mock, numpy, pandas, duckdb) and pristine sqlglot. Each run is a
-  fork of it. If the patch touches sqlglot/, the child drops sqlglot from sys.modules and
-  imports the patched copy. tests.* are never preloaded.
-- The child runs the requested ids with the stdlib unittest machinery (one suite, so
-  setUpClass/setUpModule run as usual). Failure, error, unexpected success, a failing
-  subTest, an error in a class/module fixture, a module import error or a missing test
-  all count as failed; skips do not.
-- The tests' spawn ProcessPoolExecutors (TestOptimizer.setUpClass, executor tpch/tpcds)
-  would re-import pandas/duckdb/sqlglot in up to os.cpu_count() fresh interpreters.
-  The child maps multiprocessing.get_context("spawn") to "fork" and PYTHON_CPU_COUNT=1
-  keeps it to one worker, so arguments and results are still pickled across a real
-  process boundary but without the interpreter start-ups.
-- cpu_s = forked child (os.wait4 rusage, includes its pool workers) + zygote bookkeeping +
-  this process's own work, plus the zygote's start-up cost on the call that started it.
+"""Live test runner with selective-purge zygote, in-process _SyncPool (_LazyFuture),
+subTest fail-fast, optmap fixture-pair slicing, packing-slack early-stop, and in-zygote TPC proxy.
 """
 
 import atexit
@@ -35,7 +9,6 @@ import re
 import resource
 import select
 import shutil
-import signal
 import subprocess
 import sys
 import time
@@ -43,6 +16,7 @@ import time
 RUN_DIR = "/tmp/br_run"
 TREE = RUN_DIR + "/tree"
 PYC_DIR = "/tmp/br_pyc"
+
 _HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
@@ -73,7 +47,6 @@ def _safe_rel(p):
 
 
 def _git_header_paths(rest):
-    # "a/X b/Y": try the split where both halves name the same path first.
     cands = [m.start() for m in re.finditer(r" b/", rest)]
     for c in cands:
         a, b = rest[:c], rest[c + 1:]
@@ -128,7 +101,7 @@ def parse_patch(text):
             o_len = 1 if m.group(2) is None else int(m.group(2))
             n_start = int(m.group(3))
             n_len = 1 if m.group(4) is None else int(m.group(4))
-            body = []  # [op, text, noeol]
+            body = []
             ol = nl = 0
             j = i + 1
             while (ol < o_len or nl < n_len) and j < n:
@@ -198,7 +171,7 @@ def _join(lines, noeol):
 def _apply_hunks(text, hunks, name):
     L, noeol = _split(text)
     offset = 0
-    last = 0  # hunks must apply in order, after the previous one
+    last = 0
     for o_start, o_len, n_start, n_len, body in hunks:
         old = [t for op, t, _ in body if op != "+"]
         new = [t for op, t, _ in body if op != "-"]
@@ -207,10 +180,6 @@ def _apply_hunks(text, hunks, name):
         if pos is None:
             pos = _find([x.rstrip("\r") for x in L], [x.rstrip("\r") for x in old], want, last)
             if pos is None:
-                # A hunk that edits/appends at EOF can carry a synthetic trailing
-                # blank context line (" " -> "") even though _split stripped the
-                # file's final "\n", making len(old) exceed len(L) - pos by one.
-                # Retry the match at EOF with that trailing "" dropped.
                 if not noeol and old and old[-1] == "" and len(old) >= 2:
                     old_trim = old[:-1]
                     if len(L) >= len(old_trim):
@@ -222,23 +191,17 @@ def _apply_hunks(text, hunks, name):
                         ):
                             pos = pos_eof
                             old = old_trim
-                            # Only drop the synthetic EOF "new" blank line when the
-                            # hunk's last body line is that empty context line. When
-                            # it is a "+" (e.g. appending a method), keep new as-is
-                            # so the blank separator before the new code survives.
                             if (body and body[-1][0] == " " and body[-1][1] == ""
                                     and new and new[-1] == ""):
                                 new = new[:-1]
                 if pos is None:
                     raise PatchError(f"hunk @@ -{o_start},{o_len} does not apply to {name}")
-        at_end = pos + len(old) == len(L)
         L[pos:pos + len(old)] = new
         last = pos + len(new)
-        offset = pos - (o_start - 1 if o_len else o_start) + (len(new) - len(old))
-        if at_end and body:
-            news = [b for b in body if b[0] != "-"]
-            if news:
-                noeol = news[-1][2]
+        offset += len(new) - len(old)
+        if pos + len(new) == len(L):
+            if body:
+                noeol = body[-1][2]
             elif not L:
                 noeol = False
     return _join(L, noeol)
@@ -272,7 +235,7 @@ def apply_patch(patch_text, src_root):
     """-> {relpath: new bytes, or None for a deleted file}. Raises PatchError."""
     if not patch_text or not patch_text.strip():
         return {}
-    work = {}  # rel -> str | None
+    work = {}
 
     def get(rel):
         if rel in work:
@@ -345,11 +308,11 @@ def build_tree(src_root, changes, tree=TREE):
         parts = rel.split("/")
         for k in range(len(parts)):
             kids.setdefault("/".join(parts[:k]), set()).add(parts[k])
-    mat = set(kids)  # every ancestor dir of a changed path
+    mat = set(kids)
     if not prebuilt:
         mat |= pkg
     mat.add("")
-    for d in list(mat):  # ancestors of materialized dirs
+    for d in list(mat):
         while d:
             d = d.rpartition("/")[0]
             mat.add(d)
@@ -399,7 +362,7 @@ def build_tree(src_root, changes, tree=TREE):
 # ------------------------------------------------------------------ zygote (runs in a child python)
 
 _ZYGOTE = r'''
-import gc, json, os, resource, signal, sys
+import concurrent.futures, concurrent.futures.process, gc, json, os, pickle, resource, signal, sys
 tree, preload = sys.argv[1], sys.argv[2]
 lite = len(sys.argv) > 3 and sys.argv[3] == "1"
 sys.path[:] = [tree] + [p for p in sys.path if p not in ("", ".", tree)]
@@ -437,10 +400,156 @@ def cpu(ru):
     return ru.ru_utime + ru.ru_stime
 
 
-def run_ids(ids):
+class _TestFailedFast(BaseException):
+    pass
+
+
+_CHECK_PICKLE = False
+
+
+class _LazyFuture(concurrent.futures.Future):
+    def __init__(self, fn, args, kwargs):
+        super().__init__()
+        self._task = (fn, args, kwargs)
+        self._ran = False
+        self._val = None
+        self._exc = None
+        self.set_result(None)
+
+    def _exec(self):
+        if not self._ran:
+            self._ran = True
+            fn, args, kwargs = self._task
+            self._task = None
+            try:
+                if _CHECK_PICKLE:
+                    fn, args, kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
+                val = fn(*args, **kwargs)
+                if _CHECK_PICKLE:
+                    val = pickle.loads(pickle.dumps(val))
+                self._val = val
+            except BaseException as exc:
+                self._exc = exc
+
+    def result(self, timeout=None):
+        self._exec()
+        if self._exc is not None:
+            raise self._exc
+        return self._val
+
+    def exception(self, timeout=None):
+        self._exec()
+        return self._exc
+
+
+class _SyncPool:
+    def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kwargs):
+        if initializer is not None:
+            initializer(*pickle.loads(pickle.dumps(initargs)))
+
+    def submit(self, fn, /, *args, **kwargs):
+        return _LazyFuture(fn, args, dict(kwargs))
+
+    def map(self, fn, *iterables, timeout=None, chunksize=1):
+        futs = [self.submit(fn, *args) for args in zip(*iterables)]
+        return (f.result() for f in futs)
+
+    def shutdown(self, wait=True, *, cancel_futures=False):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.shutdown()
+
+
+def _pack_cost(durs):
+    if not durs:
+        return 0
+    order = sorted(durs, reverse=True)
+    best = 10**12
+    for k in range(1, 9):
+        loads = [0] * k
+        for d in order:
+            i = loads.index(min(loads))
+            loads[i] += d
+        c = max(loads) + 2000 * k
+        if c < best:
+            best = c
+    return best
+
+
+def _run_tpcds_proxy(req):
+    from sqlglot import exp, parse_one
+    from sqlglot.optimizer import optimizer
+    from tests.helpers import TPCDS_SCHEMA, TPCH_SCHEMA, load_sql_fixture_pairs, string_to_bool
+
+    suite = req.get("suite") or "tpcds"
+    subset_str = req.get("subset") or ""
+    only = {int(x) for x in subset_str.split(",") if x} if subset_str else None
+    if suite == "tpch":
+        base_schema = TPCH_SCHEMA
+        pairs = list(enumerate(load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"), start=1))
+    else:
+        base_schema = TPCDS_SCHEMA
+        pairs = list(enumerate(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"), start=1))
+
+    cases = [
+        (i, meta, sql, expected)
+        for i, (meta, sql, expected) in pairs
+        if only is None or (i - 1) in only
+    ]
+    cases.sort(key=lambda c: (len(c[2]), c[0]))
+
+    for i, meta, sql, expected in cases:
+        dialect = meta.get("dialect")
+        kwargs = {"schema": base_schema}
+        if schema_override := meta.get("schema"):
+            kwargs["schema"] = json.loads(schema_override)
+        for key in ("leave_tables_isolated", "validate_qualify_columns", "canonicalize_table_aliases"):
+            if meta.get(key) is not None:
+                kwargs[key] = string_to_bool(meta.get(key))
+        if dialect:
+            kwargs["dialect"] = dialect
+        try:
+            optimized = optimizer.optimize(parse_one(sql, read=dialect), **kwargs)
+            for expression in optimized.walk():
+                for arg_key, arg in expression.args.items():
+                    for child_node in arg if isinstance(arg, list) else [arg]:
+                        if isinstance(child_node, exp.Expr):
+                            assert child_node.arg_key == arg_key
+                            assert child_node.parent is expression
+            optimized = pickle.loads(pickle.dumps(optimized))
+            actual = optimized.sql(pretty=True, dialect=dialect)
+        except BaseException as e:
+            return {"ok": False, "why": f"query {i}: {type(e).__name__}: {e}"[:80]}
+        if actual != expected:
+            return {"ok": False, "why": f"query {i}: mismatch"}
+    return {"ok": True, "why": "passed"}
+
+
+def run_ids(ids, ms_map=None, fixed_ms=None, early_stop=False, opt_slices=None, fail_fast=True):
     import unittest.case, unittest.suite
+
+    if opt_slices:
+        try:
+            import tests.helpers as _th
+            _orig_lfp = _th.load_sql_fixture_pairs
+            _slice_sets = {k: set(v) for k, v in opt_slices.items()}
+            def _sliced_lfp(path, *a, **kw):
+                rows = list(_orig_lfp(path, *a, **kw))
+                allow = _slice_sets.get(path)
+                if allow is None:
+                    return rows
+                return [r for idx, r in enumerate(rows, 1) if idx in allow]
+            _th.load_sql_fixture_pairs = _sliced_lfp
+        except BaseException:
+            pass
+
     groups = {}
     failed = set()
+    remaining = set()
     for tid in ids:
         f, sep, rest = tid.partition("::")
         parts = rest.split("::")
@@ -448,73 +557,143 @@ def run_ids(ids):
             failed.add(tid)
             continue
         groups.setdefault(f[:-3].replace("/", "."), {}).setdefault(parts[0], []).append((parts[1], tid))
-    suite = unittest.TestSuite()
-    owner = {}   # id(test instance) -> pytest id
-    insts = []
-    by_cls = {}  # "module.Class" -> [pytest ids]
-    by_mod = {}
+        remaining.add(tid)
+
+    ms_lookup = ms_map or {}
+    fixed_list = list(fixed_ms or ())
+
+    ordered_mods = []
     for modname, classes in groups.items():
+        ord_cls = []
+        mmax = 0
+        for cname, meths in classes.items():
+            meths.sort(key=lambda x: (-ms_lookup.get(x[1], 0), x[1]))
+            cmax = max((ms_lookup.get(t, 0) for _, t in meths), default=0)
+            if cmax > mmax:
+                mmax = cmax
+            ord_cls.append((cname, meths, cmax))
+        ord_cls.sort(key=lambda x: (-x[2], x[0]))
+        ordered_mods.append((modname, ord_cls, mmax))
+    ordered_mods.sort(key=lambda x: (-x[2], x[0]))
+
+    def check_stop():
+        if not early_stop or not ms_lookup:
+            return False
+        if not remaining:
+            return True
+        base_durs = fixed_list + [ms_lookup.get(t, 0) for t in failed]
+        lower_ms = _pack_cost(base_durs)
+        upper_ms = _pack_cost(base_durs + [ms_lookup.get(t, 0) for t in remaining])
+        return (upper_ms - lower_ms) <= 25
+
+    in_call = [False]
+
+    for modname, ord_cls, _mmax in ordered_mods:
+        if check_stop():
+            break
         try:
             mod = importlib.import_module(modname)
         except BaseException:
-            for meths in classes.values():
-                failed.update(t for _, t in meths)
+            for _cname, meths, _cmax in ord_cls:
+                for _, t in meths:
+                    failed.add(t)
+                    remaining.discard(t)
             continue
-        for cname, meths in classes.items():
+        if hasattr(mod, "ProcessPoolExecutor"):
+            mod.ProcessPoolExecutor = _SyncPool
+
+        suite = unittest.TestSuite()
+        owner = {}
+        by_cls = {}
+        by_mod = {}
+        for cname, meths, _cmax in ord_cls:
             cls = getattr(mod, cname, None)
             if not (isinstance(cls, type) and issubclass(cls, unittest.TestCase)):
-                failed.update(t for _, t in meths)
+                for _, t in meths:
+                    failed.add(t)
+                    remaining.discard(t)
                 continue
             key = f"{cls.__module__}.{cls.__qualname__}"
             for meth, tid in meths:
                 if not callable(getattr(cls, meth, None)):
                     failed.add(tid)
+                    remaining.discard(tid)
                     continue
                 try:
                     inst = cls(meth)
                 except BaseException:
                     failed.add(tid)
+                    remaining.discard(tid)
                     continue
-                insts.append(inst)
+                if fail_fast:
+                    orig_call = inst._callTestMethod
+                    def _wrapped_call(method, _orig=orig_call):
+                        in_call[0] = True
+                        try:
+                            _orig(method)
+                        except _TestFailedFast:
+                            pass
+                        finally:
+                            in_call[0] = False
+                    inst._callTestMethod = _wrapped_call
                 owner[id(inst)] = tid
                 by_cls.setdefault(key, []).append(tid)
                 by_mod.setdefault(cls.__module__, []).append(tid)
                 suite.addTest(inst)
 
-    class R(unittest.TestResult):
-        def _mark(self, test):
-            tid = owner.get(id(test))
-            if tid is not None:
-                failed.add(tid)
-                return
-            desc = getattr(test, "description", "") or str(test)
-            name = desc.partition(" (")[2].rstrip(")")
-            hit = by_cls.get(name) or by_mod.get(name)
-            if hit is None:
-                hit = [t for k, v in by_cls.items() if name.startswith(k) or k.startswith(name) for t in v] or list(owner.values())
-            failed.update(hit)
+        class R(unittest.TestResult):
+            def _mark(self, test):
+                tid = owner.get(id(test))
+                if tid is not None:
+                    failed.add(tid)
+                    remaining.discard(tid)
+                    if check_stop():
+                        self.shouldStop = True
+                    return
+                desc = getattr(test, "description", "") or str(test)
+                name = desc.partition(" (")[2].rstrip(")")
+                hit = by_cls.get(name) or by_mod.get(name)
+                if hit is None:
+                    hit = [t for k, v in by_cls.items() if name.startswith(k) or k.startswith(name) for t in v] or list(owner.values())
+                failed.update(hit)
+                remaining.difference_update(hit)
+                if check_stop():
+                    self.shouldStop = True
 
-        def addError(self, test, err):
-            self._mark(test)
-
-        def addFailure(self, test, err):
-            self._mark(test)
-
-        def addSubTest(self, test, subtest, err):
-            if err is not None:
+            def addError(self, test, err):
                 self._mark(test)
 
-        def addUnexpectedSuccess(self, test):
-            self._mark(test)
+            def addFailure(self, test, err):
+                self._mark(test)
 
-        def addSkip(self, test, reason):
-            pass
+            def addSubTest(self, test, subtest, err):
+                if err is not None:
+                    if err[0] is not None and issubclass(err[0], unittest.SkipTest):
+                        return
+                    self._mark(test)
+                    if fail_fast and in_call[0]:
+                        raise _TestFailedFast()
 
-        def addExpectedFailure(self, test, err):
-            pass
+            def addUnexpectedSuccess(self, test):
+                self._mark(test)
 
-    suite(R())
-    return sorted(failed)
+            def addSkip(self, test, reason):
+                pass
+
+            def addExpectedFailure(self, test, err):
+                pass
+
+            def stopTest(self, test):
+                tid = owner.get(id(test))
+                if tid is not None:
+                    remaining.discard(tid)
+                if check_stop():
+                    self.shouldStop = True
+
+        if owner:
+            suite(R())
+
+    return sorted(failed | remaining)
 
 
 def child(req):
@@ -542,7 +721,8 @@ def child(req):
         if name.split(".", 1)[0] in purge:
             del sys.modules[name]
     importlib.invalidate_caches()
-    if req.get("op") == "import_check":
+    op = req.get("op")
+    if op == "import_check":
         res = {"ok": False, "why": "", "ok_tests": []}
         try:
             import sqlglot
@@ -565,7 +745,26 @@ def child(req):
             json.dump(res, f)
         os.replace(tmp, req["out"])
         return 0
-    if req["fork_pool"]:
+    if op == "tpcds_proxy":
+        try:
+            import sqlglot
+            if not os.path.abspath(sqlglot.__file__).startswith(tree + os.sep):
+                raise RuntimeError("sqlglot imported from outside the run tree")
+            res = _run_tpcds_proxy(req)
+        except BaseException as e:
+            res = {"ok": False, "why": f"{type(e).__name__}: {e}"[:80]}
+        tmp = req["out"] + ".part"
+        with open(tmp, "w") as f:
+            json.dump(res, f)
+        os.replace(tmp, req["out"])
+        return 0
+    if req.get("sync_pool", True):
+        global _CHECK_PICKLE
+        cfiles = set(req.get("changed_files") or ())
+        _CHECK_PICKLE = bool({"sqlglot/serde.py", "sqlglot/expressions/core.py"} & cfiles)
+        concurrent.futures.ProcessPoolExecutor = _SyncPool
+        concurrent.futures.process.ProcessPoolExecutor = _SyncPool
+    elif req["fork_pool"]:
         import multiprocessing
         orig = multiprocessing.get_context
         def get_context(method=None):
@@ -574,12 +773,19 @@ def child(req):
             return orig(method)
         multiprocessing.get_context = get_context
     try:
-        import sqlglot  # a patch that breaks this import fails every test via module import
+        import sqlglot
     except BaseException:
         sqlglot = None
     if sqlglot is not None and not os.path.abspath(sqlglot.__file__).startswith(tree + os.sep):
         raise RuntimeError("sqlglot imported from outside the run tree")
-    failed = run_ids(req["ids"])
+    failed = run_ids(
+        req["ids"],
+        ms_map=req.get("ms_map"),
+        fixed_ms=req.get("fixed_ms"),
+        early_stop=bool(req.get("early_stop", False)),
+        opt_slices=req.get("opt_slices"),
+        fail_fast=bool(req.get("fail_fast", True)),
+    )
     tmp = req["out"] + ".part"
     with open(tmp, "w") as f:
         json.dump({"failed": failed}, f)
@@ -697,7 +903,7 @@ def _zygote(src_root, lite=False):
             _Z_LITE.close()
             _Z_LITE = None
         if _Z_LITE is None:
-            build_tree(src_root, {})  # pristine tree so preloaded sqlglot.__path__ points inside TREE
+            build_tree(src_root, {})
             info = _src_info(src_root)
             _Z_LITE = _Zygote(src_root, preload=False, dwb=info["prebuilt"], lite=True)
             _STATS["zygote_starts"] += 1
@@ -709,7 +915,7 @@ def _zygote(src_root, lite=False):
         _Z.close()
         _Z = None
     if _Z is None:
-        build_tree(src_root, {})  # pristine tree for the preload
+        build_tree(src_root, {})
         _Z = _Zygote(src_root, preload=True, dwb=info["prebuilt"])
         _STATS["zygote_starts"] += 1
         _STATS["startup_cpu_s"] += _Z.startup_cpu
@@ -798,7 +1004,72 @@ def check_imports(patch_text, sql_mods, test_mods, src_root="/sqlglot", timeout_
         _rmtree(RUN_DIR)
 
 
-def run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, _fork_pool=True, lite=False):
+def run_tpcds_proxy(patch_text, subset="", suite="tpcds", src_root="/sqlglot", timeout_s=40.0):
+    """Replay TPC-DS / TPC-H optimizer queries inside forked _Z_LITE child."""
+    global _Z_LITE
+    s0, c0 = _cpu_self(), _cpu_children()
+    try:
+        changes = apply_patch(patch_text, src_root)
+    except (PatchError, ValueError, UnicodeError) as e:
+        return {"ok": False, "why": f"patch: {e}"[:80], "cpu_s": 0.0}
+    out = os.path.join(RUN_DIR, "proxy_result.json")
+    pid = None
+    try:
+        z, startup = _zygote(src_root, lite=True)
+        build_tree(src_root, changes)
+        _rmtree(out)
+        z.send({
+            "op": "tpcds_proxy",
+            "subset": subset,
+            "suite": suite,
+            "out": out,
+            "tmp": os.path.join(RUN_DIR, "tmp"),
+            "timeout": timeout_s,
+            "purge": any(r.split("/", 1)[0] == "sqlglot" for r in changes),
+            "changed_mods": _changed_sqlglot_mods(changes),
+            "dwb": z.dwb,
+            "fork_pool": False,
+        })
+        deadline = time.monotonic() + timeout_s
+        msg = z.read(30.0)
+        if not msg or "pid" not in msg:
+            raise RuntimeError("zygote did not fork")
+        pid = msg["pid"]
+        msg = z.read(max(0.0, deadline - time.monotonic()))
+        if msg is None:
+            _kill_group(pid)
+            m2 = z.read(30.0)
+            cpu = (m2["cpu"] + m2["zcpu"]) if m2 else 0.0
+            return {"ok": False, "why": f"timeout after {timeout_s}s", "cpu_s": cpu + startup}
+        cpu = msg["cpu"] + msg["zcpu"] + startup + (_cpu_self() - s0) + (_cpu_children() - c0)
+        with open(out) as f:
+            res = json.load(f)
+        res["cpu_s"] = cpu
+        return res
+    except Exception as e:
+        if pid:
+            _kill_group(pid)
+        if _Z_LITE is not None:
+            _Z_LITE.close()
+            _Z_LITE = None
+        return {"ok": False, "why": f"error {e!r}"[:80], "cpu_s": 0.0}
+    finally:
+        _rmtree(RUN_DIR)
+
+
+def run_tests(
+    patch_text,
+    test_ids,
+    src_root="/sqlglot",
+    timeout_s=20.0,
+    _fork_pool=True,
+    lite=False,
+    ms_map=None,
+    fixed_ms=None,
+    early_stop=False,
+    opt_slices=None,
+    fail_fast=True,
+):
     global _Z, _Z_LITE
     t_wall = time.monotonic()
     s0, c0 = _cpu_self(), _cpu_children()
@@ -826,10 +1097,23 @@ def run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, _fork_p
         detail["startup"] = startup
         build_tree(src_root, changes)
         _rmtree(out)
-        z.send({"ids": ids, "out": out, "tmp": os.path.join(RUN_DIR, "tmp"), "timeout": timeout_s,
-                "purge": any(r.split("/", 1)[0] == "sqlglot" for r in changes),
-                "changed_mods": _changed_sqlglot_mods(changes),
-                "dwb": z.dwb, "fork_pool": bool(_fork_pool)})
+        z.send({
+            "ids": ids,
+            "out": out,
+            "tmp": os.path.join(RUN_DIR, "tmp"),
+            "timeout": timeout_s,
+            "purge": any(r.split("/", 1)[0] == "sqlglot" for r in changes),
+            "changed_mods": _changed_sqlglot_mods(changes),
+            "changed_files": list(changes),
+            "dwb": z.dwb,
+            "fork_pool": bool(_fork_pool),
+            "sync_pool": True,
+            "ms_map": ms_map,
+            "fixed_ms": fixed_ms,
+            "early_stop": bool(early_stop),
+            "opt_slices": opt_slices,
+            "fail_fast": bool(fail_fast),
+        })
         deadline = time.monotonic() + timeout_s
         msg = z.read(30.0)
         if not msg or "pid" not in msg:
@@ -851,7 +1135,7 @@ def run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, _fork_p
         except (OSError, ValueError, KeyError):
             return finish(ids, False, f"child produced no result (wait status {msg.get('status')})")
         return finish(failed, True, None)
-    except Exception as e:  # zygote broken: restart on next call
+    except Exception as e:
         if pid:
             _kill_group(pid)
         if lite:

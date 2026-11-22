@@ -44,12 +44,28 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+# portability: when mounted read-only at /app/bench inside the eval image,
+# runner.py lives next door in /app (same for a local submission checkout).
+_PARENT = os.path.dirname(_HERE)
+if os.path.isfile(os.path.join(_PARENT, "runner.py")):
+    sys.path.insert(0, _PARENT)
 import runner  # noqa: E402
 
 PART_DIR = "/tmp/br_part"
 TREE = PART_DIR + "/tree"
-QUERYMAP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "querymap.json.gz")
+def _default_querymap():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "querymap.json.gz"),
+                 os.path.join(os.path.dirname(here), "querymap.json.gz"),
+                 "/app/querymap.json.gz"):
+        if os.path.exists(cand):
+            return cand
+    return os.path.join(here, "querymap.json.gz")
+
+
+QUERYMAP = os.environ.get("BR_QUERYMAP", _default_querymap())
 
 TEST_IDS = {
     "tpch": "tests/test_executor.py::TestExecutor::test_execute_tpch",
@@ -82,25 +98,49 @@ _SETUP_CACHE = {}
 
 
 def queries_touching(querymap, which, changed):
-    """changed: {relpath: set(old-side line numbers)} -> (sorted query indices, touches_setup)."""
+    """changed: {relpath: set(old-side line numbers)} -> (sorted query indices, touches_setup).
+
+    Option B (fixed): a changed line counts as touching setup only if it is
+    recorded in setup_lines for that file AND it is not executed by any query
+    of this suite (i.e. it appears in no query's line coverage for the file).
+    Before the fix, any changed line present in setup_lines forced
+    touches_setup=True -- even lines that queries also execute, for which
+    replaying the covering queries is a sufficient check. Those overlap lines
+    no longer force the full test; setup-exclusive lines still do.
+    """
     sec = querymap[which]
     n = sec["n"]
     setup = querymap.get("setup_lines", {})
-    sc = _SETUP_CACHE.get(id(querymap))
+    sc = _SETUP_CACHE.get((id(querymap), which))
     if sc is None or sc[0] is not querymap:
-        sc = _SETUP_CACHE[id(querymap)] = (querymap, {})
+        sc = _SETUP_CACHE[(id(querymap), which)] = (querymap, {})
     acc = 0
     touches = False
     for rel, lines in changed.items():
         fl = sec["lines"].get(rel)
-        if rel not in sc[1]:
-            sc[1][rel] = set(setup.get(rel, ()))
-        sl = sc[1][rel]
+        entry = sc[1].get(rel)
+        if entry is None:
+            sl = set(setup.get(rel, ()))
+            qcov = set()
+            if fl:
+                for k in fl.keys():
+                    try:
+                        qcov.add(int(k))
+                    except (TypeError, ValueError):
+                        continue
+            entry = sc[1][rel] = (sl, qcov)
+        else:
+            sl, qcov = entry
         for ln in lines:
-            if ln in sl:
+            try:
+                ln_i = int(ln)
+            except (TypeError, ValueError):
+                continue
+            # Option B: setup-exclusive lines only.
+            if ln_i in sl and ln_i not in qcov:
                 touches = True
             if fl:
-                v = fl.get(str(ln))
+                v = fl.get(str(ln_i))
                 if v:
                     acc |= int.from_bytes(base64.b64decode(v), "little")
     return [i for i in range(n) if (acc >> i) & 1], touches
@@ -595,3 +635,122 @@ def shutdown():
 import atexit  # noqa: E402
 
 atexit.register(shutdown)
+# ------------------------------------------------------------------ self-test (Option B)
+
+def _queries_touching_old(querymap, which, changed):
+    """Pre-fix logic, kept for before/after demonstration in --test."""
+    sec = querymap[which]
+    n = sec["n"]
+    setup = querymap.get("setup_lines", {})
+    acc = 0
+    touches = False
+    for rel, lines in changed.items():
+        fl = sec["lines"].get(rel)
+        sl = set(setup.get(rel, ()))
+        for ln in lines:
+            if ln in sl:
+                touches = True
+            if fl:
+                v = fl.get(str(ln))
+                if v:
+                    acc |= int.from_bytes(base64.b64decode(v), "little")
+    return [i for i in range(n) if (acc >> i) & 1], touches
+
+
+def _run_self_test():
+    import gzip
+    import json
+    failures = []
+
+    def check(name, cond, detail=""):
+        print(("PASS " if cond else "FAIL ") + name + ((" :: " + str(detail)) if detail and not cond else ""))
+        if not cond:
+            failures.append(name)
+
+    # -- synthetic querymap: setup lines {1,2,3}, query 0 covers lines 3,10 --
+    import base64 as _b64
+
+    def bits(*idx):
+        acc = 0
+        for i in idx:
+            acc |= 1 << i
+        nbytes = max(1, (acc.bit_length() + 7) // 8)
+        return _b64.b64encode(acc.to_bytes(nbytes, "little")).decode()
+
+    synth = {
+        "n_test": None,  # placeholder, unused
+        "setup_lines": {"a/b.py": [1, 2, 3]},
+        "s": {"n": 2, "lines": {"a/b.py": {"3": bits(0), "10": bits(0, 1)}}},
+    }
+    old_idx, old_t = _queries_touching_old(synth, "s", {"a/b.py": {3}})
+    new_idx, new_t = queries_touching(synth, "s", {"a/b.py": {3}})
+    check("overlap line: old touches_setup=True", old_t is True, (old_idx, old_t))
+    check("overlap line: new touches_setup=False", new_t is False, (new_idx, new_t))
+    check("overlap line: query indices unchanged", old_idx == new_idx, (old_idx, new_idx))
+    _, new_t2 = queries_touching(synth, "s", {"a/b.py": {2}})
+    check("setup-only line: new touches_setup=True", new_t2 is True)
+    new_idx3, new_t3 = queries_touching(synth, "s", {"a/b.py": {10}})
+    check("query-only line: touches_setup=False", new_t3 is False, (new_idx3, new_t3))
+    check("query-only line: selects query 0 and 1", new_idx3 == [0, 1], new_idx3)
+
+    # -- real querymap: characterize the fix across every suite --
+    try:
+        with gzip.open(QUERYMAP, "rt") as f:
+            qm = json.load(f)
+    except OSError as e:
+        print("SKIP real-querymap checks (no querymap at %s: %s)" % (QUERYMAP, e))
+        return 1 if failures else 0
+    for which in ("tpch", "tpcds", "tpch_opt"):
+        if which not in qm:
+            continue
+        sec = qm[which]
+        setup = qm.get("setup_lines", {})
+        n_overlap = n_setup_only = 0
+        ex_overlap = ex_setup_only = None
+        for rel, slist in setup.items():
+            fl = sec["lines"].get(rel, {})
+            for ln in slist:
+                if str(ln) in fl:
+                    n_overlap += 1
+                    if ex_overlap is None:
+                        ex_overlap = (rel, ln)
+                else:
+                    n_setup_only += 1
+                    if ex_setup_only is None:
+                        ex_setup_only = (rel, ln)
+        print("real %s: setup_lines=%d setup_only=%d overlap=%d" % (
+            which, n_overlap + n_setup_only, n_setup_only, n_overlap))
+        if ex_overlap is not None:
+            rel, ln = ex_overlap
+            o_idx, o_t = _queries_touching_old(qm, which, {rel: {ln}})
+            n_idx, n_t = queries_touching(qm, which, {rel: {ln}})
+            check("%s overlap %s:%d old=True new=False" % (which, rel, ln),
+                  o_t is True and n_t is False, ("old", o_idx, o_t, "new", n_idx, n_t))
+            check("%s overlap %s:%d indices agree" % (which, rel, ln), o_idx == n_idx)
+        if ex_setup_only is not None:
+            rel, ln = ex_setup_only
+            o_idx, o_t = _queries_touching_old(qm, which, {rel: {ln}})
+            n_idx, n_t = queries_touching(qm, which, {rel: {ln}})
+            check("%s setup-only %s:%d still True/True" % (which, rel, ln),
+                  o_t is True and n_t is True, ("old", o_t, "new", n_t))
+
+    # -- reference files from the task: query lines must NOT touch setup --
+    try:
+        tpcds_lines = qm["tpcds"]["lines"].get("sqlglot/__init__.py", {})
+        tpcds_setup = set(qm["setup_lines"].get("sqlglot/__init__.py", []))
+        qlines = {int(k) for k in tpcds_lines}
+        check("sqlglot/__init__.py: query lines disjoint from setup",
+              not (qlines & tpcds_setup), (qlines & tpcds_setup))
+    except KeyError:
+        pass
+
+    print("self-test: %d failure(s)" % len(failures))
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    if len(_sys.argv) > 1 and _sys.argv[1] == "--test":
+        _sys.exit(_run_self_test())
+    _sys.stderr.write("usage: partial_fixed.py --test\n")
+    _sys.exit(2)
