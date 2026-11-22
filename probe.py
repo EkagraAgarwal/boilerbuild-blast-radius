@@ -86,6 +86,23 @@ def main():
             if d not in markers:
                 markers[d] = pick(ms, d, set())
             out.append({"commit": o["commit"], "workers": [markers[d]]})
+        elif MODE == "census3":
+            r = why.get(o["commit"], "")
+            tab = "table sqlglot/" in r or "table tests/" in r
+            st = ("SYNTAX", "import-fail", "import-risk", "importtime", "toplevel-import", "collection",
+                  "header:", "cached:", "testfile", "conftest", "unmapped", "repo-file", "read-as-data")
+            fx = ("opened tests/fixtures", "tpc-fixture", "fixture-same")
+            if k < 2 or tab:
+                d = 0
+            elif any(t in r for t in st):
+                d = 41
+            elif any(t in r for t in fx):
+                d = 1681
+            else:
+                d = 1
+            if d not in markers:
+                markers[d] = pick(ms, d, set())
+            out.append({"commit": o["commit"], "workers": [markers[d]]})
         elif MODE == "keeptable":
             r = why.get(o["commit"], "")
             tab = "table sqlglot/" in r or "table tests/" in r
