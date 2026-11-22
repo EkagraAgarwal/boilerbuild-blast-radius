@@ -437,7 +437,7 @@ def cpu(ru):
     return ru.ru_utime + ru.ru_stime
 
 
-def run_ids(ids):
+def run_ids(ids, slice_map=None, hooks=None):
     import unittest.case, unittest.suite
     groups = {}
     failed = set()
@@ -481,7 +481,22 @@ def run_ids(ids):
                 by_mod.setdefault(cls.__module__, []).append(tid)
                 suite.addTest(inst)
 
+    H = None
+    if slice_map:
+        import importlib.util as _iu
+        _sp = _iu.spec_from_file_location("slicehooks", hooks)
+        H = _iu.module_from_spec(_sp)
+        _sp.loader.exec_module(H)
+        H.install()
+
     class R(unittest.TestResult):
+        def startTest(self, test):
+            super().startTest(test)
+            if H is not None:
+                tid = owner.get(id(test))
+                H.STATE["keep"] = set(slice_map[tid]) if tid in slice_map else None
+                H.reset()
+
         def _mark(self, test):
             tid = owner.get(id(test))
             if tid is not None:
@@ -579,7 +594,7 @@ def child(req):
         sqlglot = None
     if sqlglot is not None and not os.path.abspath(sqlglot.__file__).startswith(tree + os.sep):
         raise RuntimeError("sqlglot imported from outside the run tree")
-    failed = run_ids(req["ids"])
+    failed = run_ids(req["ids"], req.get("slice"), req.get("hooks"))
     tmp = req["out"] + ".part"
     with open(tmp, "w") as f:
         json.dump({"failed": failed}, f)
@@ -798,7 +813,8 @@ def check_imports(patch_text, sql_mods, test_mods, src_root="/sqlglot", timeout_
         _rmtree(RUN_DIR)
 
 
-def run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, _fork_pool=True, lite=False):
+def run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, _fork_pool=True, lite=False,
+              slice_map=None):
     global _Z, _Z_LITE
     t_wall = time.monotonic()
     s0, c0 = _cpu_self(), _cpu_children()
@@ -829,7 +845,8 @@ def run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, _fork_p
         z.send({"ids": ids, "out": out, "tmp": os.path.join(RUN_DIR, "tmp"), "timeout": timeout_s,
                 "purge": any(r.split("/", 1)[0] == "sqlglot" for r in changes),
                 "changed_mods": _changed_sqlglot_mods(changes),
-                "dwb": z.dwb, "fork_pool": bool(_fork_pool)})
+                "dwb": z.dwb, "fork_pool": bool(_fork_pool), "slice": slice_map,
+                "hooks": os.path.join(os.path.dirname(os.path.abspath(__file__)), "slicehooks.py")})
         deadline = time.monotonic() + timeout_s
         msg = z.read(30.0)
         if not msg or "pid" not in msg:

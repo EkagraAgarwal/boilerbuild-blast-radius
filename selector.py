@@ -2473,6 +2473,199 @@ def run_estimate(sel, tests_meta):
     return est
 
 
+# ---------------------------------------------------------------- unit slicing
+# units.marshal.z (built offline from the pinned commit) records, per heavy test, which sqlglot
+# lines each outermost subTest / validate_* call executes, plus the lines run outside any unit
+# (import time, setUpClass, glue). For an in-place edit of function-body statements, a unit that
+# never executed the edited statement behaves exactly as at the pinned commit, so running only
+# the units that did execute it decides the test for a fraction of its cost.
+SLICE_ON = os.environ.get("BR_SLICE", "1") == "1"
+SLICE_BUDGET_S = float(os.environ.get("BR_SLICE_BUDGET", "30"))
+SLICE_MIN_MS = int(os.environ.get("BR_SLICE_MIN_MS", "100"))
+SLICE_BLOCK = ("table ", "table-union", "SYNTAX", "apply-failed", "error", "import-fail", "import-risk",
+               "importtime", "toplevel-import", "collection", "header:", "cached:", "testfile", "conftest",
+               "unmapped", "repo-file", "read-as-data", "opened tests/", "tpc-fixture", "deleted", "renamed",
+               "binary", "pytest-config", "regdiff-", "added[")
+_UNITS = []
+_AST = {}
+
+
+def _units():
+    if not _UNITS:
+        try:
+            import marshal
+            import zlib
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "units.marshal.z"), "rb") as fh:
+                _UNITS.append(marshal.loads(zlib.decompress(fh.read())))
+        except Exception as ex:  # noqa: BLE001
+            log(f"slice: no unit map ({ex!r})")
+            _UNITS.append({})
+    return _UNITS[0]
+
+
+def _edit_spans(patch_text):
+    """{rel: set(old lines)} covering every edited statement, or None when the patch is not a
+    set of in-place edits of statements inside function bodies of existing sqlglot .py files."""
+    import ast
+    rem = {}
+    rel = None
+    lines = patch_text.split("\n")
+    i = 0
+    while i < len(lines):
+        l = lines[i]
+        if l.startswith("diff --git"):
+            rel = None
+        elif l.startswith("--- "):
+            a = l[4:].strip()
+            if a == "/dev/null":
+                return None
+            rel = a[2:] if a.startswith("a/") else a
+        elif l.startswith("+++ "):
+            b = l[4:].strip()
+            if b == "/dev/null" or (b[2:] if b.startswith("b/") else b) != rel:
+                return None
+            if not (rel.startswith("sqlglot/") and rel.endswith(".py")):
+                return None
+        elif l.startswith("@@") and rel:
+            m = re.match(r"@@ -(\d+)(?:,\d+)? \+\d+", l)
+            if not m:
+                return None
+            ln = int(m.group(1)) - 1
+            i += 1
+            block_rm, block_add = [], 0
+            while i < len(lines) and not lines[i].startswith(("@@", "diff --git", "--- ")):
+                h = lines[i]
+                if h.startswith("-"):
+                    ln += 1
+                    block_rm.append(ln)
+                elif h.startswith("+"):
+                    block_add += 1
+                elif h.startswith("\\"):
+                    pass
+                else:
+                    if block_add and not block_rm:
+                        return None  # pure insertion: no pristine line to anchor on
+                    rem.setdefault(rel, set()).update(block_rm)
+                    block_rm, block_add = [], 0
+                    ln += 1
+                i += 1
+            if block_add and not block_rm:
+                return None
+            rem.setdefault(rel, set()).update(block_rm)
+            continue
+        i += 1
+    if not rem or not any(rem.values()):
+        return None
+    out = {}
+    for rel, lns in rem.items():
+        if rel not in _AST:
+            try:
+                with open(os.path.join(SRC, rel), encoding="utf-8") as fh:
+                    _AST[rel] = ast.parse(fh.read())
+            except Exception:  # noqa: BLE001
+                _AST[rel] = None
+        tree = _AST[rel]
+        if tree is None:
+            return None
+        span = set()
+        for L in lns:
+            best, in_func = None, False
+            node, inf = tree, False
+            while True:
+                nxt = None
+                for ch in ast.iter_child_nodes(node):
+                    if isinstance(ch, ast.stmt) and ch.lineno <= L <= ch.end_lineno:
+                        nxt = ch
+                        break
+                if nxt is None:
+                    break
+                best, in_func = nxt, inf
+                inf = inf or isinstance(nxt, (ast.FunctionDef, ast.AsyncFunctionDef))
+                node = nxt
+            if best is None or not in_func:
+                return None  # module/class level or a def header: runs at import time
+            body = getattr(best, "body", None)
+            if isinstance(body, list) and body and L < body[0].lineno:
+                span.update(range(best.lineno, body[0].lineno))
+            elif isinstance(body, list):
+                span.update(range(best.lineno, best.end_lineno + 1))
+            else:
+                span.update(range(best.lineno, best.end_lineno + 1))
+        out[rel] = span
+    return out
+
+
+def slice_candidates(plans, num, ids, ms, t_start):
+    if not SLICE_ON:
+        return
+    U = None
+    spent = 0.0
+    runner = None
+    for p in plans:
+        if not p[2] or any(r.startswith(SLICE_BLOCK) for r in p[3]):
+            continue
+        if time.monotonic() - t_start > 100 or spent > SLICE_BUDGET_S:
+            p[3].append("slice: skipped (budget)")
+            continue
+        spans = _edit_spans(p[1])
+        if not spans:
+            continue
+        if U is None:
+            U = _units()
+        if not U:
+            return
+        smap = {}
+        for k in p[2]:
+            if ms.get(k, 0) < SLICE_MIN_MS:
+                continue
+            tid = ids[k]
+            ent = U.get(tid)
+            if ent is None:
+                continue
+            n, common, lmap = ent
+            if any(l in common.get(rel, ()) for rel, s in spans.items() for l in s):
+                continue
+            bits = 0
+            for rel, s in spans.items():
+                fl = lmap.get(rel)
+                if fl:
+                    for l in s:
+                        bits |= fl.get(l, 0)
+            smap[tid] = [i for i in range(n) if bits >> i & 1]
+        if not smap:
+            continue
+        cand = {num[t] for t in smap}
+        saving = (pack(p[2], ms)[0] - pack(p[2] - cand, ms)[0]) / 1000.0
+        heavy = any(t.split("::")[0] in EXPENSIVE_FILES for t in smap)
+        est = (0.6 if heavy else 0.25) + sum(ms[num[t]] / 1000.0 * (len(u) / max(1, U[t][0]) + 0.15)
+                                             * (1.6 if t.split("::")[0] in EXPENSIVE_FILES else 1.0)
+                                             for t, u in smap.items())
+        if saving < 0.5 or est > 0.6 * saving:
+            continue
+        if runner is None:
+            try:
+                import runner as _r
+                runner = _r
+            except Exception as ex:  # noqa: BLE001
+                log(f"slice: runner unavailable {ex!r}")
+                return
+        lite = not any(t.split("::")[0] in EXPENSIVE_FILES for t in smap)
+        try:
+            res = runner.run_tests(p[1], sorted(smap), src_root=str(SRC), timeout_s=20.0, lite=lite,
+                                   slice_map=smap)
+        except Exception as ex:  # noqa: BLE001
+            p[3].append(f"slice: error {ex!r}"[:80])
+            continue
+        spent += res.get("cpu_s", 0.0)
+        if not res.get("ok"):
+            p[3].append(f"slice: kept ({res.get('error')})"[:80])
+            continue
+        failed = {num[i] for i in res["failed"] if i in num}
+        drop = cand - failed
+        p[2] = p[2] - drop
+        p[3].append(f"slice {len(cand)} -> dropped {len(drop)} (~{saving:.1f}s, {res.get('cpu_s', 0):.2f}s cpu)")
+
+
 def fast_run_candidates(plans, meta, num, ids, ms, t_start):
     """Run cheap candidate sets on the lite zygote; keep only tests that actually fail."""
     if not FAST_RUN_ENABLED:
@@ -2581,6 +2774,7 @@ def main():
     proxy_tpch(plans, mp, num, ids, t_start, ms)
     partial_executor(plans, num, ms, t_start)
 
+    slice_candidates(plans, num, ids, ms, t_start)
     fast_run_candidates(plans, meta, num, ids, ms, t_start)
     eligible = []
     if RUN_ENABLED:
