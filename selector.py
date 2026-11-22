@@ -2615,6 +2615,7 @@ def slice_candidates(plans, num, ids, ms, t_start):
         if not U:
             return
         smap = {}
+        nsel = {}
         for k in p[2]:
             if ms.get(k, 0) < SLICE_MIN_MS:
                 continue
@@ -2622,7 +2623,8 @@ def slice_candidates(plans, num, ids, ms, t_start):
             ent = U.get(tid)
             if ent is None:
                 continue
-            n, common, lmap = ent
+            n, common, lmap = ent[0], ent[1], ent[2]
+            keys = ent[3] if len(ent) > 3 else None
             if any(l in common.get(rel, ()) for rel, s in spans.items() for l in s):
                 continue
             bits = 0
@@ -2631,15 +2633,25 @@ def slice_candidates(plans, num, ids, ms, t_start):
                 if fl:
                     for l in s:
                         bits |= fl.get(l, 0)
-            smap[tid] = [i for i in range(n) if bits >> i & 1]
+            us = [i for i in range(n) if bits >> i & 1]
+            if not us:
+                # the isolated trace never ran the edit, yet the selector picked the test: an effect
+                # from outside the test (lazy registry loads, earlier tests) -> never slice it away
+                continue
+            nsel[tid] = len(us)
+            if keys:
+                smap[tid] = {"reg": [keys[i][1] for i in us if keys[i][0] == "r"],
+                             "cf": [[keys[i][1], keys[i][2]] for i in us if keys[i][0] == "c"]}
+            else:
+                smap[tid] = us
         if not smap:
             continue
         cand = {num[t] for t in smap}
         saving = (pack(p[2], ms)[0] - pack(p[2] - cand, ms)[0]) / 1000.0
         heavy = any(t.split("::")[0] in EXPENSIVE_FILES for t in smap)
-        est = (0.6 if heavy else 0.25) + sum(ms[num[t]] / 1000.0 * (len(u) / max(1, U[t][0]) + 0.15)
+        est = (0.6 if heavy else 0.25) + sum(ms[num[t]] / 1000.0 * (nsel[t] / max(1, U[t][0]) + 0.15)
                                              * (1.6 if t.split("::")[0] in EXPENSIVE_FILES else 1.0)
-                                             for t, u in smap.items())
+                                             for t in smap)
         if saving < 0.5 or est > 0.6 * saving:
             continue
         if runner is None:

@@ -494,7 +494,7 @@ def run_ids(ids, slice_map=None, hooks=None):
             super().startTest(test)
             if H is not None:
                 tid = owner.get(id(test))
-                H.STATE["keep"] = set(slice_map[tid]) if tid in slice_map else None
+                H.set_keep(slice_map.get(tid))
                 H.reset()
 
         def _mark(self, test):
