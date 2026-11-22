@@ -1208,6 +1208,31 @@ def _tpc_fixture_parses_cleanly(old, f, patch_text):
     return True
 
 
+TPC_EXEC_ONLY_INPUTS = {
+    # TestExecutor's executor tests read only (meta, input sql) of each fixture pair
+    # (`for args, sql, _ in sqls` / `_, sql, _ = ...`); the expected half is unused by them.
+    "tests/test_executor.py::TestExecutor::test_execute_tpch",
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+}
+TPC_INPUT_SPLIT = os.environ.get("BR_TPC_INPUT_SPLIT", "1") == "1"
+
+
+def _tpc_pairs(lines):
+    stmts = "\n".join(l for l in lines if l and not l.startswith("--")).split(";")
+    return [(stmts[i].strip(), stmts[i + 1].strip()) for i in range(0, len(stmts), 2) if i + 1 < len(stmts)]
+
+
+def _tpc_inputs_unchanged(old, patch_text):
+    """True when the patched TPC fixture yields the same number of pairs with identical
+    (meta + input sql) halves, i.e. only expected-output halves changed."""
+    src = source_lines(old)
+    new = apply_hunks(src, patch_text, old) if src is not None else None
+    if src is None or new is None:
+        return False
+    a, b = _tpc_pairs(src), _tpc_pairs(new)
+    return len(a) == len(b) and all(x[0] == y[0] for x, y in zip(a, b)) and a != b
+
+
 # ---------------------------------------------------------------- selection
 
 def candidates(mp, files, tests_by_file, patch_text, all_tests, bonus=None):
@@ -1676,7 +1701,11 @@ def candidates(mp, files, tests_by_file, patch_text, all_tests, bonus=None):
             if tpc is not None and f["new"] == old and _tpc_fixture_parses_cleanly(old, f, patch_text):
                 # TestExecutor.setUpClass loads the TPC query files for every test in the class, but only
                 # these tests use the queries (a new "#" line could make the loader raise: all openers)
-                hit = {TEST_NUM[t] for t in tpc if t in TEST_NUM}
+                use = tpc
+                if TPC_INPUT_SPLIT and _tpc_inputs_unchanged(old, patch_text):
+                    use = [t for t in tpc if t not in TPC_EXEC_ONLY_INPUTS]
+                    reasons.append("tpc-expected-only")
+                hit = {TEST_NUM[t] for t in use if t in TEST_NUM}
                 sel |= hit
                 reasons.append(f"tpc-fixture {old} -> {len(hit)}")
             elif i is not None:
