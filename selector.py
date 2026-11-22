@@ -567,6 +567,8 @@ def _is_type_checking_only_edit(src, new, f):
 
 EQUIV = os.environ.get("BR_EQUIV", "1") == "1"
 TABLE_ON = os.environ.get("BR_TABLE", "1") == "1"
+# When 2+ .py files are all exact table hits, union their answers instead of dropping the table.
+TABLE_UNION = os.environ.get("BR_TABLE_UNION", "1") == "1"
 TABLE_PATH = os.environ.get("BR_TABLE_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "table.marshal"))
 _table = []
 
@@ -1237,11 +1239,43 @@ def _tpc_inputs_unchanged(old, patch_text):
 
 def candidates(mp, files, tests_by_file, patch_text, all_tests, bonus=None):
     # the table answers one mutated line exactly; two mutated code files can interact, so then
-    # fall back to the coverage rules for all of them
-    use_table = TABLE_ON and sum(1 for r_, f_ in files.items() if r_.endswith(".py") and f_["old"]
-                                 and f_["new"] == f_["old"] and table_lookup(f_["old"], f_) is not None) <= 1
+    # fall back to the coverage rules for all of them.  BR_TABLE_UNION=1 carves out the case where
+    # every table-shaped .py edit is an exact hit: union the per-file answers instead of dropping
+    # the table for the whole commit.
     sel = set()
     reasons = []
+    table_hits = {}
+    if TABLE_ON:
+        for r_, f_ in files.items():
+            if r_.endswith(".py") and f_["old"] and f_["new"] == f_["old"] and not f_.get("binary"):
+                h = table_lookup(f_["old"], f_)
+                if h is not None:
+                    table_hits[r_] = h
+
+    def _table_candidate(f_):
+        # the edit shape the table would answer, had this exact mutant been in it
+        return (len([l for l in f_["removed"] if not is_trivial(l)]) == 1
+                and len([l for l in f_["added"] if not is_trivial(l)]) == 1
+                and len(f_["changed"]) == 1 and len(f_["removed"]) == 1)
+
+    union_ok = TABLE_UNION and TABLE_ON and len(table_hits) >= 2
+    if union_ok:
+        # "no other risky reasons": no broad/special handler and no table-shaped .py edit without
+        # an exact answer.  Fixtures, comment-only edits and other code files keep their normal
+        # path in the loop below and are unioned in exactly as today.
+        cfg_names = ("pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini")
+        for r_, f_ in files.items():
+            if r_ in table_hits:
+                continue
+            old = f_["old"]
+            if (old is None or f_["new"] is None or f_["new"] != old or f_.get("binary")
+                    or (not r_.endswith(".py") and r_.rsplit("/", 1)[-1] in cfg_names)
+                    or (r_.endswith(".py") and _table_candidate(f_))):
+                union_ok = False
+                break
+    use_table = TABLE_ON and (len(table_hits) <= 1 or union_ok)
+    if union_ok:
+        reasons.append(f"table-union x{len(table_hits)}")
     for rel, f in files.items():
         old = f["old"]
         name = (f["new"] or old or "").rsplit("/", 1)[-1]
