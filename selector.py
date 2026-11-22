@@ -2461,6 +2461,10 @@ RUN_ENABLED = os.environ.get("BR_RUN", "0") == "1"
 FAST_RUN_ENABLED = os.environ.get("BR_FAST_RUN", "1") == "1"
 FAST_RUN_MAX_S = float(os.environ.get("BR_FAST_MAX", "3.0"))
 FAST_RUN_BUDGET_S = float(os.environ.get("BR_FAST_BUDGET", "25.0"))
+# Broader fail-fast replay: zero out a whole selection when every chosen test passes.
+REPLAY_ZERO = os.environ.get("BR_REPLAY_ZERO", "1") == "1"
+REPLAY_UNSAFE_REASONS = ("table ", "SYNTAX", "apply-failed", "error", "import-fail",
+                         "opened tests/fixtures/", "tpc-fixture")
 
 
 def run_estimate(sel, tests_meta):
@@ -2478,19 +2482,27 @@ def fast_run_candidates(plans, meta, num, ids, ms, t_start):
     if not FAST_RUN_ENABLED:
         return
     eligible = []
+    zero_eligible = []
     for p in plans:
         if not p[2] or any(r.startswith(("table ", "SYNTAX", "apply-failed", "error", "import-fail"))
                            for r in p[3]):
             continue
-        if len(p[2]) == 1 and any(r.startswith("opened tests/fixtures/") for r in p[3]):
-            continue  # single fixture opener: one test, no useful ROI
         if any((meta.get(k) or ("", 0))[0] in EXPENSIVE_FILES for k in p[2]):
             continue
-        if any(r.startswith("header:") for r in p[3]):
-            continue  # signature/name edits almost always fail their callers -> poor replay ROI
         n_files = len({meta[k][0] for k in p[2] if k in meta})
         est = 0.14 + 0.06 * n_files + sum(meta[k][1] * 1.15 + 0.004 for k in p[2] if k in meta)
         packed_s = pack(p[2], ms)[0] / 1000.0
+        # Broader fail-fast path: if every selected test passes, the whole selection was
+        # unnecessary and can become ZERO workers. Any "could be a mass failure" reason is
+        # excluded: for those, a passing replay is not evidence the selection was bogus.
+        if (REPLAY_ZERO and not any(r.startswith(REPLAY_UNSAFE_REASONS) for r in p[3])
+                and packed_s - est >= 1.0):
+            zero_eligible.append(p)
+        # Original high-ROI path (unchanged).
+        if len(p[2]) == 1 and any(r.startswith("opened tests/fixtures/") for r in p[3]):
+            continue  # single fixture opener: one test, no useful ROI
+        if any(r.startswith("header:") for r in p[3]):
+            continue  # signature/name edits almost always fail their callers -> poor replay ROI
         # Only replay high-ROI over-selected commits (added handlers, registry/import-time hits,
         # or expensive multi-worker selections); skip header edits and tiny plain commits.
         is_added = any(r.startswith("added[") for r in p[3])
@@ -2504,7 +2516,7 @@ def fast_run_candidates(plans, meta, num, ids, ms, t_start):
             continue
         if est <= FAST_RUN_MAX_S and est < packed_s * 0.65 and packed_s - est >= 1.0:
             eligible.append((-(packed_s - est), p))
-    if not eligible:
+    if not eligible and not zero_eligible:
         return
     try:
         import runner
@@ -2533,6 +2545,31 @@ def fast_run_candidates(plans, meta, num, ids, ms, t_start):
             p[2] = failed
         else:
             p[3].append(f"fastrun: kept ({res.get('error')}, {res.get('cpu_s', 0):.2f}s)"[:100])
+    for p in zero_eligible:
+        if any(p is q for _n, q in eligible):  # already handled by the high-ROI path
+            continue
+        if time.monotonic() - t_start > 115 or spent > FAST_RUN_BUDGET_S:
+            p[3].append("replay0: skipped (budget)")
+            continue
+        orig_sel = set(p[2])
+        # Cheapest test first: a failure is then found before paying for the slow ones.
+        order = sorted(p[2], key=lambda k: (meta.get(k) or ("", 0))[1])
+        try:
+            res = runner.run_tests(p[1], [ids[k] for k in order], src_root=str(SRC),
+                                   timeout_s=12.0, lite=True, fail_fast=True)
+        except Exception as ex:  # noqa: BLE001
+            p[3].append(f"replay0: error {ex!r}"[:80])
+            continue
+        ran = True
+        spent += res.get("cpu_s", 0.0)
+        failed = {num[i] for i in res.get("failed", ()) if i in num}
+        if res.get("aborted"):
+            p[3].append(f"replay0 aborted after {len(failed)} ({res['cpu_s']:.2f}s)")
+        elif res["ok"] and not failed:
+            p[2] = set()
+            p[3].append(f"replay0 {len(orig_sel)} -> 0 ({res['cpu_s']:.2f}s)")
+        else:
+            p[3].append(f"replay0: kept ({res.get('error')}, {res['cpu_s']:.2f}s)"[:100])
     if ran:
         try:
             runner.shutdown(clear_cache=False)
@@ -2650,6 +2687,11 @@ def main():
         px = [r for r in reasons if r.startswith("proxy")]
         log(f"{cid}: {len(sel)} tests, {cost/1000:.1f}s {' | '.join(px)} {'; '.join(r for r in reasons if r not in px)[:300]}")
         print(json.dumps({"commit": cid, "workers": ws}), flush=True)
+    import resource
+    me = resource.getrusage(resource.RUSAGE_SELF)
+    kids = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu = (me.ru_utime + me.ru_stime) + (kids.ru_utime + kids.ru_stime)
+    print(f"probe cpu {cpu:.3f}s", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

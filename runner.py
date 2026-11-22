@@ -1,7 +1,10 @@
 """Verify-by-running: apply a patch to a cheap mirror of sqlglot in /tmp and run tests.
 
-    run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0) -> dict
-        {"failed": set(ids), "ok": bool, "cpu_s": float, "error": str|None, "detail": {...}}
+    run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, fail_fast=False) -> dict
+        {"failed": set(ids), "ok": bool, "cpu_s": float, "error": str|None, "detail": {...},
+         "aborted": bool}  # only when fail_fast=True
+    fail_fast runs the ids in the given order and stops at the first failure/error (a
+    failing subTest included), reporting "aborted": True and the failures seen so far.
 
 Design
 - The patched tree lives at /tmp/br_run/tree. Unchanged files/dirs are symlinks into the
@@ -437,10 +440,11 @@ def cpu(ru):
     return ru.ru_utime + ru.ru_stime
 
 
-def run_ids(ids):
+def run_ids(ids, fail_fast=False):
     import unittest.case, unittest.suite
     groups = {}
     failed = set()
+    insts_by_tid = {}
     for tid in ids:
         f, sep, rest = tid.partition("::")
         parts = rest.split("::")
@@ -476,16 +480,20 @@ def run_ids(ids):
                     failed.add(tid)
                     continue
                 insts.append(inst)
+                insts_by_tid[tid] = inst
                 owner[id(inst)] = tid
                 by_cls.setdefault(key, []).append(tid)
                 by_mod.setdefault(cls.__module__, []).append(tid)
-                suite.addTest(inst)
+                if not fail_fast:
+                    suite.addTest(inst)
 
     class R(unittest.TestResult):
         def _mark(self, test):
             tid = owner.get(id(test))
             if tid is not None:
                 failed.add(tid)
+                if fail_fast:
+                    self.stop()
                 return
             desc = getattr(test, "description", "") or str(test)
             name = desc.partition(" (")[2].rstrip(")")
@@ -493,6 +501,8 @@ def run_ids(ids):
             if hit is None:
                 hit = [t for k, v in by_cls.items() if name.startswith(k) or k.startswith(name) for t in v] or list(owner.values())
             failed.update(hit)
+            if fail_fast:
+                self.stop()
 
         def addError(self, test, err):
             self._mark(test)
@@ -513,7 +523,13 @@ def run_ids(ids):
         def addExpectedFailure(self, test, err):
             pass
 
-    suite(R())
+    if fail_fast:
+        # Execute strictly in the order the ids were given, so a failure in the
+        # cheapest test aborts before any later (more expensive) test is run.
+        suite = unittest.TestSuite([insts_by_tid[t] for t in dict.fromkeys(ids) if t in insts_by_tid])
+    result = R()
+    result.failfast = bool(fail_fast)  # also stops mid-test on a failing subTest
+    suite(result)
     return sorted(failed)
 
 
@@ -579,10 +595,11 @@ def child(req):
         sqlglot = None
     if sqlglot is not None and not os.path.abspath(sqlglot.__file__).startswith(tree + os.sep):
         raise RuntimeError("sqlglot imported from outside the run tree")
-    failed = run_ids(req["ids"])
+    fail_fast = bool(req.get("fail_fast"))
+    failed = run_ids(req["ids"], fail_fast=fail_fast)
     tmp = req["out"] + ".part"
     with open(tmp, "w") as f:
-        json.dump({"failed": failed}, f)
+        json.dump({"failed": failed, "aborted": fail_fast and bool(failed)}, f)
     os.replace(tmp, req["out"])
     return 0
 
@@ -798,7 +815,8 @@ def check_imports(patch_text, sql_mods, test_mods, src_root="/sqlglot", timeout_
         _rmtree(RUN_DIR)
 
 
-def run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, _fork_pool=True, lite=False):
+def run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, _fork_pool=True,
+              lite=False, fail_fast=False):
     global _Z, _Z_LITE
     t_wall = time.monotonic()
     s0, c0 = _cpu_self(), _cpu_children()
@@ -806,12 +824,15 @@ def run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, _fork_p
     detail = {"child": 0.0, "zygote": 0.0, "startup": 0.0, "parent": 0.0, "wall": 0.0}
     _STATS["calls"] += 1
 
-    def finish(failed, ok, error):
+    def finish(failed, ok, error, aborted=False):
         detail["parent"] = (_cpu_self() - s0) + (_cpu_children() - c0)
         detail["wall"] = time.monotonic() - t_wall
         cpu = detail["child"] + detail["zygote"] + detail["startup"] + detail["parent"]
         _rmtree(RUN_DIR)
-        return {"failed": set(failed), "ok": ok, "cpu_s": cpu, "error": error, "detail": detail}
+        res = {"failed": set(failed), "ok": ok, "cpu_s": cpu, "error": error, "detail": detail}
+        if fail_fast:
+            res["aborted"] = bool(aborted)
+        return res
 
     try:
         changes = apply_patch(patch_text, src_root)
@@ -829,7 +850,7 @@ def run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, _fork_p
         z.send({"ids": ids, "out": out, "tmp": os.path.join(RUN_DIR, "tmp"), "timeout": timeout_s,
                 "purge": any(r.split("/", 1)[0] == "sqlglot" for r in changes),
                 "changed_mods": _changed_sqlglot_mods(changes),
-                "dwb": z.dwb, "fork_pool": bool(_fork_pool)})
+                "dwb": z.dwb, "fork_pool": bool(_fork_pool), "fail_fast": bool(fail_fast)})
         deadline = time.monotonic() + timeout_s
         msg = z.read(30.0)
         if not msg or "pid" not in msg:
@@ -847,10 +868,11 @@ def run_tests(patch_text, test_ids, src_root="/sqlglot", timeout_s=20.0, _fork_p
             return finish(ids, False, f"timeout after {timeout_s}s")
         try:
             with open(out) as f:
-                failed = json.load(f)["failed"]
+                data = json.load(f)
+            failed = data["failed"]
         except (OSError, ValueError, KeyError):
             return finish(ids, False, f"child produced no result (wait status {msg.get('status')})")
-        return finish(failed, True, None)
+        return finish(failed, True, None, aborted=data.get("aborted", bool(failed)))
     except Exception as e:  # zygote broken: restart on next call
         if pid:
             _kill_group(pid)
